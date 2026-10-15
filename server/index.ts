@@ -2,22 +2,26 @@
 // server/index.ts
 // The ONE Node.js app that does everything:
 //   1. serves the built game files (dist/client)
-//   2. runs the multiplayer server (Socket.IO) - the server "owns" positions
-//      and uses Rapier physics for wall/floor collisions
+//   2. runs the multiplayer server (Socket.IO) - the server "owns" positions,
+//      uses Rapier physics for collisions (walls, stairs, furniture, doors),
+//      keeps doors in sync, and runs the ghosts
 //   3. relays voice-chat signaling messages between players (WebRTC setup)
 //
 // Network messages are tiny arrays to save mobile data:
 //   client -> server  'in'  [seq, ix, iy, yaw*1000, pitch*1000]   my input
-//   server -> clients 'st'  [slot,x,z,ack,yaw,pitch, ...]         everyone (20x/sec)
-//   server -> clients 'pj'  {s,n,a,x,z,w}   a player joined (w = yaw)
+//   server -> clients 'st'  [slot,x,y,z,ack,yaw,pitch, ...]       everyone (20x/sec)
+//   server -> clients 'pj'  {s,n,a,x,y,z,w} a player joined (w = yaw)
 //   server -> clients 'pl'  slot            a player left
+//   client -> server  'door' doorId          "I'm opening/closing this door"
+//   server -> clients 'door' [doorId, 0|1]   a door closed/opened
+//   server -> clients 'gh'  [ghost, spot]    a ghost moved (spot -1 = vanished)
 //   both ways         'sig' {to|from, d}    voice-chat (WebRTC) setup messages
 // =====================================================================
 import express from 'express';
 import http from 'http';
 import path from 'path';
 import { Server, Socket } from 'socket.io';
-import { MAX_PLAYERS, Mover, NUM_AVATARS, SPAWNS, SPAWN_YAW, TICK_DT, TICK_RATE } from '../shared/game';
+import { DOOR_REACH, EYE_HEIGHT, initPhysics, LAYOUT, MAX_PLAYERS, Mover, NUM_AVATARS, TICK_DT, TICK_RATE } from '../shared/game';
 
 const PORT = Number(process.env.PORT) || 3000;
 const GRACE_MS = 20000; // how long a dropped player's spot is kept so they can reconnect
@@ -27,6 +31,7 @@ interface Player {
   name: string;
   av: number; // avatar number
   x: number;
+  y: number; // feet height
   z: number;
   yaw: number; // where they look (left/right), radians
   pitch: number; // where they look (up/down), radians
@@ -39,14 +44,22 @@ interface Player {
   dropAt: number; // when to give up waiting for a reconnect
 }
 
+interface Ghost {
+  spot: number; // index into LAYOUT.ghostSpots, or -1 while vanished
+  last: number; // the spot it was at before vanishing
+  backAt: number; // when it reappears (ms)
+}
+
 interface Room {
   code: string;
   players: Map<number, Player>;
   dirty: boolean; // something changed -> send a snapshot this tick
+  mover: Mover; // this room's physics world (each room has its own doors)
+  openDoors: Set<string>;
+  ghosts: Ghost[];
 }
 
 const rooms = new Map<string, Room>();
-let mover: Mover; // Rapier collision engine (created before the server starts listening)
 
 // ---------- web server ----------
 const app = express();
@@ -92,19 +105,39 @@ const r2 = (n: number) => Math.round(n * 100) / 100;
 
 /** What we tell clients about a player (short keys = fewer bytes). */
 function publicInfo(p: Player) {
-  return { s: p.slot, n: p.name, a: p.av, x: r2(p.x), z: r2(p.z), w: r2(p.yaw) };
+  return { s: p.slot, n: p.name, a: p.av, x: r2(p.x), y: r2(p.y), z: r2(p.z), w: r2(p.yaw) };
 }
 
-function roomInfo(room: Room) {
-  return [...room.players.values()].map(publicInfo);
+/** Everything a player needs when they (re)join: players, open doors, ghost spots. */
+function joinReply(room: Room, p: Player) {
+  return {
+    ok: true, code: room.code, slot: p.slot, token: p.token,
+    players: [...room.players.values()].map(publicInfo),
+    doors: [...room.openDoors],
+    ghosts: room.ghosts.map((g) => g.spot),
+  };
 }
+
+function makeRoom(): Room {
+  const room: Room = { code: makeCode(), players: new Map(), dirty: false, mover: new Mover(LAYOUT), openDoors: new Set(), ghosts: [] };
+  // ghosts start somewhere away from the entrance
+  const spawn = LAYOUT.spawns[0];
+  const far = LAYOUT.ghostSpots.map((_, i) => i).filter((i) => dist3(LAYOUT.ghostSpots[i], spawn) > 12);
+  for (let i = 0; i < LAYOUT.ghostCount && far.length; i++) {
+    const spot = far.splice(Math.floor(Math.random() * far.length), 1)[0];
+    room.ghosts.push({ spot, last: spot, backAt: 0 });
+  }
+  return room;
+}
+
+const dist3 = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
 
 function addPlayer(room: Room, sock: Socket, name: string, av: number): Player | null {
   for (let slot = 0; slot < MAX_PLAYERS; slot++) {
     if (room.players.has(slot)) continue;
-    const [x, z] = SPAWNS[slot];
+    const { x, y, z, yaw } = LAYOUT.spawns[slot];
     const p: Player = {
-      slot, name, av, x, z, yaw: SPAWN_YAW, pitch: 0, ix: 0, iy: 0, seq: 0,
+      slot, name, av, x, y, z, yaw, pitch: 0, ix: 0, iy: 0, seq: 0,
       lastIn: Date.now(), token: makeToken(), sock, dropAt: 0,
     };
     room.players.set(slot, p);
@@ -145,11 +178,11 @@ io.on('connection', (sock) => {
   sock.on('create', (data: any, ack?: (r: unknown) => void) => {
     if (typeof ack !== 'function') return;
     leaveCurrent(sock);
-    const room: Room = { code: makeCode(), players: new Map(), dirty: false };
+    const room = makeRoom();
     rooms.set(room.code, room);
     const p = addPlayer(room, sock, cleanName(data?.name), cleanAvatar(data?.av))!;
     bind(sock, room, p);
-    ack({ ok: true, code: room.code, slot: p.slot, token: p.token, players: roomInfo(room) });
+    ack(joinReply(room, p));
   });
 
   // Join an existing room by its 4-letter code
@@ -162,7 +195,7 @@ io.on('connection', (sock) => {
     leaveCurrent(sock);
     const p = addPlayer(room, sock, cleanName(data?.name), cleanAvatar(data?.av))!;
     bind(sock, room, p);
-    ack({ ok: true, code: room.code, slot: p.slot, token: p.token, players: roomInfo(room) });
+    ack(joinReply(room, p));
     sock.to(room.code).emit('pj', publicInfo(p)); // tell everyone else
   });
 
@@ -174,7 +207,7 @@ io.on('connection', (sock) => {
     if (!room || !p) return ack({ ok: false, err: 'That room has ended.' });
     if (p.sock && p.sock !== sock) p.sock.data.code = undefined; // old zombie connection
     bind(sock, room, p);
-    ack({ ok: true, code: room.code, slot: p.slot, token: p.token, players: roomInfo(room) });
+    ack(joinReply(room, p));
     sock.to(room.code).emit('pj', publicInfo(p)); // others reset their voice link with us
     room.dirty = true;
   });
@@ -195,6 +228,20 @@ io.on('connection', (sock) => {
     if (Number.isFinite(pitch)) p.pitch = Math.max(-1.6, Math.min(1.6, pitch));
     p.lastIn = Date.now();
     room.dirty = true; // so the client gets its new "ack" number back
+  });
+
+  // Open / close a door (only if you're standing next to it, and it isn't locked)
+  sock.on('door', (id: unknown) => {
+    const room = rooms.get(sock.data.code);
+    const p = room?.players.get(sock.data.slot);
+    const door = LAYOUT.doors.find((d) => d.id === id);
+    if (!room || !p || p.sock !== sock || !door || door.type !== 'door' || door.locked) return;
+    if (Math.hypot(p.x - door.cx, p.z - door.cz) > DOOR_REACH + 0.5 || Math.abs(p.y - door.y) > 1.5) return;
+    const open = !room.openDoors.has(door.id);
+    if (open) room.openDoors.add(door.id);
+    else room.openDoors.delete(door.id);
+    room.mover.setDoor(door.id, open);
+    io.to(room.code).emit('door', [door.id, open ? 1 : 0]);
   });
 
   // Voice-chat setup messages: just forward to the right player in the same room
@@ -243,32 +290,96 @@ function tick() {
       }
       // No input for half a second? Stop moving (safety if messages get lost).
       if (now - p.lastIn > 500) p.ix = p.iy = 0;
-      if (p.ix !== 0 || p.iy !== 0) {
-        const [nx, nz] = mover.step(p.x, p.z, p.ix, p.iy, p.yaw, TICK_DT);
-        if (nx !== p.x || nz !== p.z) {
-          p.x = nx;
-          p.z = nz;
-          changed = true;
-        }
+      const [nx, ny, nz] = room.mover.step(p.x, p.y, p.z, p.ix, p.iy, p.yaw, TICK_DT);
+      if (Math.abs(nx - p.x) + Math.abs(ny - p.y) + Math.abs(nz - p.z) > 0.0005) {
+        p.x = nx;
+        p.y = ny;
+        p.z = nz;
+        changed = true;
+      }
+      // fell out of the world somehow? back to the entrance
+      if (p.y < -10) {
+        ({ x: p.x, y: p.y, z: p.z } = LAYOUT.spawns[p.slot]);
+        changed = true;
       }
     }
+    updateGhosts(room, now);
 
     if (room.players.size === 0) {
       rooms.delete(room.code);
       continue;
     }
     if (changed) {
-      // Flat compact array: [slot, x, z, ack, yaw, pitch,  slot, x, z, ...]
+      // Flat compact array: [slot, x, y, z, ack, yaw, pitch,  slot, x, y, ...]
       const snap: number[] = [];
-      for (const p of room.players.values()) snap.push(p.slot, r2(p.x), r2(p.z), p.seq, r2(p.yaw), r2(p.pitch));
+      for (const p of room.players.values()) snap.push(p.slot, r2(p.x), r2(p.y), r2(p.z), p.seq, r2(p.yaw), r2(p.pitch));
       io.to(room.code).volatile.emit('st', snap); // volatile = ok to drop if the network is busy
     }
   }
 }
 
+// ---------- ghosts ----------
+// A ghost stands still. If someone's flashlight points straight at it (and no
+// wall is in the way) it vanishes, then reappears at another spot nearby.
+const GHOST_TOP = 2.3; // the figure is about this tall
+
+/** Is someone's flashlight beam hitting the ghost standing at (x, y, z)? */
+function litByFlashlight(room: Room, x: number, y: number, z: number): boolean {
+  for (const p of room.players.values()) {
+    if (!p.sock) continue;
+    const ex = p.x;
+    const ey = p.y + EYE_HEIGHT;
+    const ez = p.z;
+    // flat (left/right) part of where the player looks
+    const fx = -Math.sin(p.yaw);
+    const fz = -Math.cos(p.yaw);
+    const vx = x - ex;
+    const vz = z - ez;
+    const along = vx * fx + vz * fz; // how far in front of the player the ghost is
+    if (along < 0.5 || along > 25) continue; // about as far as the flashlight reaches
+    const side = Math.abs(vx * fz - vz * fx); // how far the beam passes beside it
+    if (side > 0.45 + along * 0.02) continue; // "straight at it" = the middle of the beam hits its body
+    const beamY = ey + Math.tan(p.pitch) * along; // the beam's height when it reaches the ghost
+    if (beamY < y + 0.1 || beamY > y + GHOST_TOP) continue; // over its head / at the floor in front
+    if (room.mover.lineOfSight(ex, ey, ez, x, Math.min(beamY, y + 2), z)) return true;
+  }
+  return false;
+}
+
+function updateGhosts(room: Room, now: number) {
+  room.ghosts.forEach((g, i) => {
+    if (g.spot >= 0) {
+      const s = LAYOUT.ghostSpots[g.spot];
+      if (litByFlashlight(room, s.x, s.y, s.z)) {
+        g.last = g.spot;
+        g.spot = -1;
+        g.backAt = now + 2500 + Math.random() * 3500;
+        io.to(room.code).emit('gh', [i, -1]);
+      }
+    } else if (now > g.backAt) {
+      // pick a nearby spot that is free, not right next to a player, and not lit right now
+      const from = LAYOUT.ghostSpots[g.last];
+      const taken = new Set(room.ghosts.map((o) => o.spot));
+      const ok = LAYOUT.ghostSpots
+        .map((s, idx) => ({ s, idx, d: dist3(s, from) }))
+        .filter(({ s, idx }) => idx !== g.last && !taken.has(idx)
+          && [...room.players.values()].every((p) => dist3(p, s) > 5)
+          && !litByFlashlight(room, s.x, s.y, s.z))
+        .sort((a, b) => a.d - b.d);
+      if (!ok.length) {
+        g.backAt = now + 1000; // try again in a second
+        return;
+      }
+      const pick = ok[Math.floor(Math.random() * Math.min(3, ok.length))]; // one of the 3 closest
+      g.spot = pick.idx;
+      io.to(room.code).emit('gh', [i, g.spot]);
+    }
+  });
+}
+
 // Start: load the physics engine first, then open the doors
-Mover.create().then((m) => {
-  mover = m;
+for (const w of LAYOUT.warnings) console.warn('MAP WARNING:', w);
+initPhysics().then(() => {
   setInterval(tick, 1000 / TICK_RATE);
   server.listen(PORT, () => console.log(`Game server running on port ${PORT}`));
 });

@@ -4,111 +4,94 @@
 // the exact same Rapier physics code, the player's own prediction
 // matches the server's answer almost perfectly.
 //
-// Units are METERS. The map is 32 m x 24 m. Y is "up".
+// Units are METERS. Y is "up". North = -Z, East = +X.
+// The map itself comes from shared/maps/mansion.json (see layout.ts).
 // =====================================================================
 import RAPIER from '@dimforge/rapier3d-compat';
+import { buildLayout, Layout } from './layout';
 
-export const MAP_W = 32; // map size along X (meters)
-export const MAP_D = 24; // map size along Z (meters)
-export const WALL_H = 3; // wall height (meters)
-
-export const PLAYER_RADIUS = 0.35;
+export const PLAYER_RADIUS = 0.3;
 export const PLAYER_HEIGHT = 1.7; // total capsule height
-export const EYE_HEIGHT = 1.6; // camera height above the floor
-export const SPEED = 3.6; // meters per second at full stick
+export const EYE_HEIGHT = 1.6; // camera height above the feet
+export const SPEED = 3.0; // meters per second at full stick (a careful walk)
 export const TICK_RATE = 20; // server updates per second
 export const TICK_DT = 1 / TICK_RATE; // seconds per server update
 export const MAX_PLAYERS = 6; // players per room
 export const NUM_AVATARS = 8; // how many avatars exist (see client/src/avatars.ts)
+export const DOOR_REACH = 2.6; // how close you must be to open a door (meters)
 
-// A wall/box: [x, z, width, depth, height?]  (x,z = its corner nearest the map origin)
-export type Wall = [number, number, number, number, number?];
+/** The map, built once from the data file. */
+export const LAYOUT: Layout = buildLayout();
 
-export const WALLS: Wall[] = [
-  // --- outer border ---
-  [0, 0, MAP_W, 0.64],
-  [0, MAP_D - 0.64, MAP_W, 0.64],
-  [0, 0, 0.64, MAP_D],
-  [MAP_W - 0.64, 0, 0.64, MAP_D],
-  // --- inner walls (with gaps to walk through) ---
-  [8, 0.64, 0.64, 7.2],
-  [8, 11.2, 0.64, 8],
-  [16, 4, 0.64, 10],
-  [16, 17.2, 0.64, 6.16],
-  [24, 0.64, 0.64, 8],
-  [24, 12, 0.64, 11.36],
-  [8.64, 12, 5, 0.64],
-  [20, 8, 4, 0.64],
-  [18, 18, 6, 0.64],
-  // --- pillars ---
-  [12, 6, 1.3, 1.3],
-  [20, 14, 1.3, 1.3],
-  [27.6, 6, 1.3, 1.3],
-  // --- low crates (1 m tall: good for shadows to hide behind) ---
-  [3, 3, 1, 1, 1],
-  [5, 19, 1.2, 1.2, 1],
-  [13, 16, 1, 1, 1],
-  [22, 20, 1, 1, 1],
-  [28, 18, 1.2, 1.2, 1],
-];
-
-// Where players appear when they join (the left room, facing east). One per slot.
-export const SPAWNS: [number, number][] = [
-  [2.4, 10],
-  [4, 10],
-  [5.6, 10],
-  [2.4, 12],
-  [4, 12],
-  [5.6, 12],
-];
-export const SPAWN_YAW = -Math.PI / 2; // facing +X (east)
+/** Load the physics engine (it's WebAssembly). Call once before making Movers. */
+let ready: Promise<void> | null = null;
+export function initPhysics(): Promise<void> {
+  ready ??= RAPIER.init();
+  return ready;
+}
 
 /**
- * Collision engine built on Rapier physics.
- * It holds the static world (floor + walls) and ONE capsule that is
- * teleported to each player in turn to ask: "if this player tries to move
- * by this much, how far can they actually go?"  (slides along walls,
- * stays on the floor).
+ * Collision engine built on Rapier physics, one per game room (because each
+ * room has its own doors open/closed).
+ * It holds the static world (floors, walls, stairs, furniture, doors) and ONE
+ * capsule that is moved to each player in turn to ask: "if this player tries
+ * to move by this much, where do they actually end up?" (slides along walls,
+ * walks up stairs, stays on the floor).
  */
 export class Mover {
   private world: RAPIER.World;
   private probe: RAPIER.Collider;
   private controller: RAPIER.KinematicCharacterController;
+  private doorCols = new Map<string, RAPIER.Collider>();
 
-  private constructor() {
+  /** initPhysics() must have finished first. */
+  constructor(layout: Layout = LAYOUT) {
     this.world = new RAPIER.World({ x: 0, y: 0, z: 0 });
 
-    // The floor: a big flat box whose top surface is at y = 0
-    this.world.createCollider(RAPIER.ColliderDesc.cuboid(MAP_W / 2 + 5, 0.5, MAP_D / 2 + 5).setTranslation(MAP_W / 2, -0.5, MAP_D / 2));
-
-    // The walls and crates: one box collider each
-    for (const [x, z, w, d, h = WALL_H] of WALLS) {
-      this.world.createCollider(RAPIER.ColliderDesc.cuboid(w / 2, h / 2, d / 2).setTranslation(x + w / 2, h / 2, z + d / 2));
+    for (const c of layout.colliders) {
+      const desc = RAPIER.ColliderDesc.cuboid(c.hx, c.hy, c.hz).setTranslation(c.cx, c.cy, c.cz);
+      if (c.rot) desc.setRotation({ x: 0, y: Math.sin(c.rot / 2), z: 0, w: Math.cos(c.rot / 2) });
+      this.world.createCollider(desc);
+    }
+    for (const s of layout.stairs) {
+      const desc = RAPIER.ColliderDesc.convexHull(new Float32Array(s.points));
+      if (desc) this.world.createCollider(desc);
+    }
+    for (const d of layout.doors) {
+      if (d.type !== 'door') continue;
+      const c = d.collider;
+      this.doorCols.set(d.id, this.world.createCollider(RAPIER.ColliderDesc.cuboid(c.hx, c.hy, c.hz).setTranslation(c.cx, c.cy, c.cz)));
     }
 
     // The "probe": a capsule the size of a player
     const half = (PLAYER_HEIGHT - 2 * PLAYER_RADIUS) / 2;
-    this.probe = this.world.createCollider(RAPIER.ColliderDesc.capsule(half, PLAYER_RADIUS).setTranslation(0, PLAYER_HEIGHT / 2, 0));
+    this.probe = this.world.createCollider(RAPIER.ColliderDesc.capsule(half, PLAYER_RADIUS).setTranslation(0, -50, 0));
 
-    this.controller = this.world.createCharacterController(0.01);
+    this.controller = this.world.createCharacterController(0.02);
     this.controller.setUp({ x: 0, y: 1, z: 0 });
     this.controller.setSlideEnabled(true);
+    this.controller.setMaxSlopeClimbAngle((50 * Math.PI) / 180); // stairs are ramps up to ~35 degrees
+    this.controller.setMinSlopeSlideAngle((55 * Math.PI) / 180);
+    this.controller.enableAutostep(0.3, 0.15, false); // step over thresholds and small bumps
+    this.controller.enableSnapToGround(0.4); // stick to the stairs when walking down
 
-    this.world.step(); // lets Rapier index the static colliders
+    this.world.step(); // lets Rapier index all the colliders
   }
 
-  /** Load the physics engine (it's WebAssembly) and build the world. */
-  static async create(): Promise<Mover> {
-    await RAPIER.init();
-    return new Mover();
+  /** Open (no collision) or close a door. */
+  setDoor(id: string, open: boolean) {
+    const c = this.doorCols.get(id);
+    if (!c) return;
+    c.setEnabled(!open);
+    this.world.step(); // refresh the collision index
   }
 
   /**
-   * Move a player for `dt` seconds. Returns their new [x, z].
+   * Move a player for `dt` seconds. Returns their new [x, y, z] (y = feet).
    * ix, iy = stick as whole numbers -100..100 (ix = right, iy = back).
    * yaw   = which way the player is looking (movement is relative to it).
    */
-  step(x: number, z: number, ix: number, iy: number, yaw: number, dt: number): [number, number] {
+  step(x: number, y: number, z: number, ix: number, iy: number, yaw: number, dt: number): [number, number, number] {
     let right = ix / 100;
     let fwd = -iy / 100;
     const len = Math.hypot(right, fwd);
@@ -122,10 +105,31 @@ export class Mover {
     const vx = (right * c - fwd * s) * SPEED * dt;
     const vz = (-right * s - fwd * c) * SPEED * dt;
 
-    this.probe.setTranslation({ x, y: PLAYER_HEIGHT / 2, z });
-    // a little downward push each step = the player is pressed onto the floor
-    this.controller.computeColliderMovement(this.probe, { x: vx, y: -0.05, z: vz });
+    this.probe.setTranslation({ x, y: y + PLAYER_HEIGHT / 2, z });
+    // walk, with a tiny push down so we stay on the floor (a big push would slide us down the stairs)
+    this.controller.computeColliderMovement(this.probe, { x: vx, y: -0.02, z: vz });
     const m = this.controller.computedMovement();
-    return [x + m.x, z + m.z];
+    const nx = x + m.x;
+    let ny = y + m.y;
+    const nz = z + m.z;
+    if (!this.controller.computedGrounded()) {
+      // nothing under our feet: fall
+      this.probe.setTranslation({ x: nx, y: ny + PLAYER_HEIGHT / 2, z: nz });
+      this.controller.computeColliderMovement(this.probe, { x: 0, y: -6 * dt, z: 0 });
+      ny += this.controller.computedMovement().y;
+    }
+    return [nx, ny, nz];
+  }
+
+  /** Can you see from point A to point B without a wall/closed door in the way? */
+  lineOfSight(ax: number, ay: number, az: number, bx: number, by: number, bz: number): boolean {
+    const dx = bx - ax;
+    const dy = by - ay;
+    const dz = bz - az;
+    const dist = Math.hypot(dx, dy, dz);
+    if (dist < 0.01) return true;
+    const ray = new RAPIER.Ray({ x: ax, y: ay, z: az }, { x: dx / dist, y: dy / dist, z: dz / dist });
+    const hit = this.world.castRay(ray, dist, true, undefined, undefined, this.probe);
+    return !hit || hit.timeOfImpact > dist - 0.25;
   }
 }

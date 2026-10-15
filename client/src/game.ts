@@ -1,17 +1,25 @@
 // =====================================================================
 // client/src/game.ts
-// The first-person 3D game (Three.js): dark map, flashlights with shadows,
-// other players' avatars, smooth movement.
+// The first-person 3D game (Three.js) inside the haunted mansion.
 //
-//  World   = plain data about the room (who is where, which way they look).
-//            The network code writes into it; the 3D view reads from it.
-//  createView = draws everything, reads mouse/keyboard/touch, moves YOUR
-//            player instantly (client-side prediction) and glides everyone
-//            else between server updates (interpolation).
+//  World      = plain data about the room (who is where, which way they look).
+//               The network code writes into it; the 3D view reads from it.
+//  createView = loads textures/models (with a loading bar), builds the
+//               mansion, and runs every frame: your movement (prediction),
+//               other players (interpolation), the flashlight, doors,
+//               ghosts, sounds and camera effects.
 // =====================================================================
 import * as THREE from 'three';
-import { EYE_HEIGHT, MAP_D, MAP_W, Mover, TICK_DT, WALLS, WALL_H, MAX_PLAYERS } from '../../shared/game';
+import { DOOR_REACH, EYE_HEIGHT, MAX_PLAYERS, Mover, TICK_DT } from '../../shared/game';
+import { Layout, roomAt } from '../../shared/layout';
+import { Assets, Progress } from './assets';
 import { Avatar3D, buildAvatar, FLASH_ANGLE, FLASH_RANGE } from './avatar3d';
+import { Ghosts } from './ghost';
+import { buildMansion, Mansion } from './mansion';
+import { buildMaterials, Quality } from './materials';
+import { createPost, Post } from './post';
+import { flashlightCookie } from './procedural';
+import { Soundscape } from './sound';
 import type { Settings } from './ui';
 import { HEAR_FULL, HEAR_MAX, Voice } from './voice';
 
@@ -20,6 +28,7 @@ export interface PlayerInfo {
   n: string; // name
   a: number; // avatar
   x: number;
+  y: number;
   z: number;
   w: number; // yaw (facing)
 }
@@ -27,6 +36,7 @@ export interface PlayerInfo {
 interface Sample {
   t: number; // when we received it (ms)
   x: number;
+  y: number;
   z: number;
   yaw: number;
   pitch: number;
@@ -46,17 +56,17 @@ export class World {
   private buffers = new Map<number, Sample[]>(); // recent positions of OTHER players
   // my own player (predicted locally)
   lx = 0;
+  ly = 0;
   lz = 0;
   yaw = 0; // where I look (left/right)
   pitch = 0; // where I look (up/down)
   private seq = 0;
   private pending: { seq: number; ix: number; iy: number; yaw: number }[] = []; // inputs the server hasn't confirmed yet
-  fps = 0;
 
   constructor(
     public me: number,
     players: PlayerInfo[],
-    private mover: Mover,
+    public mover: Mover,
     private sendInput: (seq: number, ix: number, iy: number, yaw: number, pitch: number) => void,
   ) {
     this.resync(players);
@@ -72,17 +82,18 @@ export class World {
       this.infos.set(p.s, p);
       if (p.s === this.me) {
         this.lx = p.x;
+        this.ly = p.y;
         this.lz = p.z;
         if (this.seq === 0) this.yaw = p.w; // first join: face the spawn direction
       } else {
-        this.buffers.set(p.s, [{ t: now, x: p.x, z: p.z, yaw: p.w, pitch: 0 }]);
+        this.buffers.set(p.s, [{ t: now, x: p.x, y: p.y, z: p.z, yaw: p.w, pitch: 0 }]);
       }
     }
   }
 
   addPlayer(p: PlayerInfo) {
     this.infos.set(p.s, p);
-    this.buffers.set(p.s, [{ t: performance.now(), x: p.x, z: p.z, yaw: p.w, pitch: 0 }]);
+    this.buffers.set(p.s, [{ t: performance.now(), x: p.x, y: p.y, z: p.z, yaw: p.w, pitch: 0 }]);
   }
 
   removePlayer(slot: number) {
@@ -90,46 +101,48 @@ export class World {
     this.buffers.delete(slot);
   }
 
-  /** Server update: [slot, x, z, ack, yaw, pitch,  slot, x, z, ...] */
+  /** Server update: [slot, x, y, z, ack, yaw, pitch,  slot, x, ...] */
   onSnapshot(a: number[]) {
     const now = performance.now();
-    for (let i = 0; i + 5 < a.length; i += 6) {
+    for (let i = 0; i + 6 < a.length; i += 7) {
       const slot = a[i];
       if (slot === this.me) {
-        this.reconcile(a[i + 1], a[i + 2], a[i + 3]);
+        this.reconcile(a[i + 1], a[i + 2], a[i + 3], a[i + 4]);
       } else {
         const buf = this.buffers.get(slot);
         if (!buf) continue;
-        buf.push({ t: now, x: a[i + 1], z: a[i + 2], yaw: a[i + 4], pitch: a[i + 5] });
+        buf.push({ t: now, x: a[i + 1], y: a[i + 2], z: a[i + 3], yaw: a[i + 5], pitch: a[i + 6] });
         if (buf.length > 12) buf.shift();
       }
     }
   }
 
   /**
-   * Prediction fix-up. The server says "you are at (sx, sz) after input #ack".
+   * Prediction fix-up. The server says "you are here after input #ack".
    * We replay the inputs it hasn't seen yet to guess where we SHOULD be now,
    * then nudge our local position toward that (a big error just snaps).
    */
-  private reconcile(sx: number, sz: number, ack: number) {
+  private reconcile(sx: number, sy: number, sz: number, ack: number) {
     this.pending = this.pending.filter((p) => p.seq > ack);
-    let ex = sx;
-    let ez = sz;
-    for (const p of this.pending) [ex, ez] = this.mover.step(ex, ez, p.ix, p.iy, p.yaw, TICK_DT);
+    let [ex, ey, ez] = [sx, sy, sz];
+    for (const p of this.pending) [ex, ey, ez] = this.mover.step(ex, ey, ez, p.ix, p.iy, p.yaw, TICK_DT);
     const dx = ex - this.lx;
+    const dy = ey - this.ly;
     const dz = ez - this.lz;
-    if (Math.hypot(dx, dz) > 1.2) {
-      this.lx = ex;
-      this.lz = ez; // way off -> snap
+    if (Math.hypot(dx, dy, dz) > 1.2) {
+      this.lx = ex; // way off -> snap
+      this.ly = ey;
+      this.lz = ez;
     } else {
       this.lx += dx * 0.2; // slightly off -> glide back
+      this.ly += dy * 0.2;
       this.lz += dz * 0.2;
     }
   }
 
-  /** Move my player right now using the input (the shared Rapier physics). */
+  /** Move my player right now (the same Rapier physics as the server). */
   moveMine(ix: number, iy: number, dtSeconds: number) {
-    [this.lx, this.lz] = this.mover.step(this.lx, this.lz, ix, iy, this.yaw, dtSeconds);
+    [this.lx, this.ly, this.lz] = this.mover.step(this.lx, this.ly, this.lz, ix, iy, this.yaw, dtSeconds);
   }
 
   /** Send my input + look direction to the server (called every 50 ms). */
@@ -154,6 +167,7 @@ export class World {
         return {
           t,
           x: a.x + (b.x - a.x) * f,
+          y: a.y + (b.y - a.y) * f,
           z: a.z + (b.z - a.z) * f,
           yaw: a.yaw + wrap(b.yaw - a.yaw) * f,
           pitch: a.pitch + (b.pitch - a.pitch) * f,
@@ -169,149 +183,105 @@ export class World {
 // ---------------------------------------------------------------------
 export interface ViewData {
   world: World;
+  layout: Layout;
   voice: Voice;
   settings: Settings;
+  openDoors: string[]; // doors already open when we joined
+  ghostSpots: number[]; // where the ghosts are when we joined
   getStick: () => { x: number; y: number };
   consumeLook: () => { dx: number; dy: number }; // touch look (pixels moved)
   onLockChange?: (locked: boolean) => void;
+  onProgress: (fraction: number, label: string) => void; // loading bar
+  onPrompt: (text: string | null) => void; // "E / ✋: open door" hint
+  requestDoor: (id: string) => void; // ask the server to open/close a door
+  onLocked: (message: string) => void;
+}
+
+export interface ViewStats {
+  fps: number;
+  calls: number;
+  triangles: number;
+  pixelRatio: number;
+  quality: Quality;
+  where: string; // position + room name (handy when editing the map file)
 }
 
 export interface ViewHandle {
-  destroy: () => void;
+  ready: Promise<void>;
+  setDoor(id: string, open: boolean, withSound: boolean): void;
+  setGhost(index: number, spot: number): void;
+  interact(): void;
+  stats(): ViewStats;
+  destroy(): void;
 }
 
-/** Texture drawn in code (no image files). */
-function canvasTexture(w: number, h: number, draw: (g: CanvasRenderingContext2D) => void) {
-  const c = document.createElement('canvas');
-  c.width = w;
-  c.height = h;
-  draw(c.getContext('2d')!);
-  const t = new THREE.CanvasTexture(c);
-  t.wrapS = t.wrapT = THREE.RepeatWrapping;
-  t.colorSpace = THREE.SRGBColorSpace;
-  t.anisotropy = 4;
-  return t;
-}
+const QUALITY: Record<Quality, { ratio: number; shadow: number; remoteLights: number }> = {
+  low: { ratio: 1, shadow: 0, remoteLights: 0 },
+  medium: { ratio: 1.25, shadow: 512, remoteLights: 2 },
+  high: { ratio: 2, shadow: 1024, remoteLights: 4 },
+};
 
 export function createView(parent: HTMLElement, data: ViewData): ViewHandle {
-  const { world, voice, settings } = data;
+  const { world, voice, settings, layout } = data;
+  const builtQuality = settings.quality; // texture sizes are chosen once, when you join
 
   // ---------- renderer, scene, camera ----------
-  const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'low-power' });
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance', stencil: false });
+  renderer.info.autoReset = false;
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
   parent.appendChild(renderer.domElement);
   renderer.domElement.className = 'game-canvas';
 
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x000000);
-  scene.fog = new THREE.FogExp2(0x000000, 0.035); // distance fades into darkness
-  scene.add(new THREE.AmbientLight(0x303048, 0.5)); // almost no light: the map is DARK
+  scene.background = new THREE.Color(0x020202);
+  scene.fog = new THREE.FogExp2(0x050403, 0.055); // long corridors fade into darkness
+  scene.add(new THREE.AmbientLight(0x2a2230, 0.09)); // just enough to make out shapes
 
-  const camera = new THREE.PerspectiveCamera(settings.fov, 1, 0.05, 80);
+  const camera = new THREE.PerspectiveCamera(settings.fov, 1, 0.05, 70);
   camera.rotation.order = 'YXZ'; // yaw first, then pitch (normal FPS camera)
   scene.add(camera);
 
-  // ---------- the map: floor + walls ----------
-  const floorTex = canvasTexture(128, 128, (g) => {
-    g.fillStyle = '#4a4a54';
-    g.fillRect(0, 0, 128, 128);
-    g.strokeStyle = '#33333b';
-    g.lineWidth = 3;
-    g.strokeRect(0, 0, 128, 128);
-    for (let i = 0; i < 40; i++) {
-      g.fillStyle = `rgba(0,0,0,${0.06 + Math.random() * 0.12})`;
-      g.fillRect(Math.random() * 120, Math.random() * 120, 3 + Math.random() * 8, 3 + Math.random() * 8);
-    }
-  });
-  floorTex.repeat.set(MAP_W / 2, MAP_D / 2);
-  const floor = new THREE.Mesh(new THREE.PlaneGeometry(MAP_W, MAP_D), new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.95 }));
-  floor.rotation.x = -Math.PI / 2;
-  floor.position.set(MAP_W / 2, 0, MAP_D / 2);
-  floor.receiveShadow = true;
-  scene.add(floor);
+  // ---------- my flashlight: warm, uneven ("cookie"), swaying, flickering ----------
+  const FLASH_POWER = 120;
+  const cookie = flashlightCookie();
+  const flash = new THREE.SpotLight(0xffc678, FLASH_POWER, FLASH_RANGE, FLASH_ANGLE, 0.55, 2);
+  const flashTarget = new THREE.Object3D();
+  scene.add(flash, flashTarget);
+  flash.target = flashTarget;
+  let aimYaw = world.yaw;
+  let aimPitch = world.pitch;
+  let walkPhase = 0;
 
-  const wallTex = canvasTexture(128, 128, (g) => {
-    g.fillStyle = '#8a8aa0';
-    g.fillRect(0, 0, 128, 128);
-    g.strokeStyle = '#55556a';
-    g.lineWidth = 4;
-    for (let y = 0; y < 128; y += 32) {
-      g.beginPath();
-      g.moveTo(0, y);
-      g.lineTo(128, y);
-      g.stroke();
-      const off = (y / 32) % 2 ? 0 : 32;
-      for (let x = off; x < 128; x += 64) {
-        g.beginPath();
-        g.moveTo(x, y);
-        g.lineTo(x, y + 32);
-        g.stroke();
-      }
-    }
-    for (let i = 0; i < 30; i++) {
-      g.fillStyle = `rgba(0,0,0,${0.05 + Math.random() * 0.1})`;
-      g.fillRect(Math.random() * 120, Math.random() * 120, 4 + Math.random() * 10, 4 + Math.random() * 10);
-    }
-  });
-  const crateTex = canvasTexture(64, 64, (g) => {
-    g.fillStyle = '#8b6a3e';
-    g.fillRect(0, 0, 64, 64);
-    g.strokeStyle = '#5a4020';
-    g.lineWidth = 5;
-    g.strokeRect(2, 2, 60, 60);
-    g.beginPath();
-    g.moveTo(2, 2);
-    g.lineTo(62, 62);
-    g.moveTo(62, 2);
-    g.lineTo(2, 62);
-    g.stroke();
-  });
-  for (const [x, z, w, d, h = WALL_H] of WALLS) {
-    const crate = h < WALL_H;
-    const tex = (crate ? crateTex : wallTex).clone();
-    tex.needsUpdate = true;
-    tex.repeat.set(crate ? 1 : Math.max(w, d) / 2, crate ? 1 : h / 2);
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9 }));
-    mesh.position.set(x + w / 2, h / 2, z + d / 2);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
-    scene.add(mesh);
-  }
+  // ---------- other players' flashlights: a few shared lights moved to the nearest players ----------
+  let pool: THREE.SpotLight[] = [];
+  const avatars = new Map<number, Avatar3D & { stepDist: number; lastX: number; lastZ: number }>();
 
-  // ---------- my flashlight: a spotlight attached to the camera ----------
-  const myLight = new THREE.SpotLight(0xfff1d6, 50, FLASH_RANGE, FLASH_ANGLE, 0.45, 2);
-  myLight.position.set(0.15, -0.12, 0);
-  const myTarget = new THREE.Object3D();
-  myTarget.position.set(0.15, -0.12, -5);
-  camera.add(myLight, myTarget);
-  myLight.target = myTarget;
-
-  // ---------- other players ----------
-  const avatars = new Map<number, Avatar3D>();
-
-  /** Shadows: only as many shadow-casting lights as the GPU can handle. */
+  // ---------- quality: shadows, resolution, effects ----------
+  let post: Post | null = null;
+  let dynScale = 1; // drops automatically if the phone can't keep up
   function applyQuality() {
-    const low = settings.lowGfx;
-    renderer.shadowMap.enabled = !low;
-    renderer.setPixelRatio(low ? 1 : Math.min(window.devicePixelRatio, 2));
-    // each shadow-casting light uses a GPU texture slot; keep a few slots free
-    let budget = Math.max(1, Math.min(MAX_PLAYERS, renderer.capabilities.maxTextures - 5));
-    const setShadow = (l: THREE.SpotLight, size: number) => {
-      const on = !low && budget > 0;
-      if (on) budget--;
-      l.castShadow = on;
-      l.shadow.mapSize.set(size, size);
-      l.shadow.bias = -0.0004;
-      l.shadow.normalBias = 0.03;
-      l.shadow.camera.near = 0.2;
-      l.shadow.camera.far = FLASH_RANGE;
-      l.shadow.map?.dispose();
-      l.shadow.map = null as unknown as THREE.WebGLRenderTarget;
-    };
-    setShadow(myLight, 1024); // my own light first
-    for (const a of avatars.values()) setShadow(a.spot, 512);
+    const q = QUALITY[settings.quality];
+    renderer.shadowMap.enabled = q.shadow > 0;
+    renderer.shadowMap.type = settings.quality === 'high' ? THREE.PCFSoftShadowMap : THREE.PCFShadowMap;
+    flash.castShadow = q.shadow > 0;
+    flash.map = q.shadow > 0 ? cookie : null; // (three.js needs shadows on for a spotlight cookie)
+    flash.shadow.mapSize.set(q.shadow || 512, q.shadow || 512);
+    flash.shadow.bias = -0.0005;
+    flash.shadow.normalBias = 0.02;
+    flash.shadow.camera.near = 0.15;
+    flash.shadow.camera.far = FLASH_RANGE;
+    flash.shadow.map?.dispose();
+    flash.shadow.map = null as unknown as THREE.WebGLRenderTarget;
+    // remote flashlight pool (changing the number of lights rebuilds shaders, so only on settings change)
+    for (const l of pool) scene.remove(l, l.target);
+    pool = Array.from({ length: Math.min(q.remoteLights, MAX_PLAYERS - 1) }, () => {
+      const l = new THREE.SpotLight(0xffcf88, 0, FLASH_RANGE * 0.8, FLASH_ANGLE, 0.6, 2);
+      scene.add(l, l.target);
+      return l;
+    });
     camera.fov = settings.fov;
-    camera.updateProjectionMatrix();
+    post?.dispose();
+    post = createPost(renderer, scene, camera, settings.quality);
     scene.traverse((o) => {
       const m = (o as THREE.Mesh).material as THREE.Material | undefined;
       if (m) m.needsUpdate = true; // shaders must be rebuilt when shadows switch on/off
@@ -322,7 +292,9 @@ export function createView(parent: HTMLElement, data: ViewData): ViewHandle {
   function resize() {
     const w = window.innerWidth;
     const h = window.innerHeight;
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, QUALITY[settings.quality].ratio) * dynScale);
     renderer.setSize(w, h);
+    post?.setSize(w, h);
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
   }
@@ -330,7 +302,9 @@ export function createView(parent: HTMLElement, data: ViewData): ViewHandle {
   // ---------- controls ----------
   const keys = new Set<string>();
   const onKeyDown = (e: KeyboardEvent) => {
+    if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
     keys.add(e.code);
+    if (e.code === 'KeyE' && !e.repeat) interact();
     if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault();
   };
   const onKeyUp = (e: KeyboardEvent) => keys.delete(e.code);
@@ -349,7 +323,17 @@ export function createView(parent: HTMLElement, data: ViewData): ViewHandle {
     if (hasPointerLock && document.pointerLockElement !== canvas) void canvas.requestPointerLock?.();
   };
   const onLockChange = () => data.onLockChange?.(document.pointerLockElement === canvas);
-
+  // Phones sometimes reset the graphics chip (e.g. after switching apps). Recover instead of staying black.
+  const onContextLost = (e: Event) => {
+    e.preventDefault(); // allows the browser to give the context back
+    console.warn('Graphics were reset by the device - restoring...');
+  };
+  const onContextRestored = () => {
+    console.warn('Graphics restored.');
+    applyQuality();
+  };
+  canvas.addEventListener('webglcontextlost', onContextLost);
+  canvas.addEventListener('webglcontextrestored', onContextRestored);
   window.addEventListener('keydown', onKeyDown);
   window.addEventListener('keyup', onKeyUp);
   window.addEventListener('blur', onBlur);
@@ -358,20 +342,88 @@ export function createView(parent: HTMLElement, data: ViewData): ViewHandle {
   canvas.addEventListener('click', onCanvasClick);
   document.addEventListener('pointerlockchange', onLockChange);
   const stopListening = settings.onChange(applyQuality);
-  if (hasPointerLock) data.onLockChange?.(false);
 
-  // ---------- the game loop ----------
+  // ---------- loading: textures, models, building the house ----------
+  let mansion: Mansion | null = null;
+  let ghosts: Ghosts | null = null;
+  let sound: Soundscape | null = null;
   let raf = 0;
   let last = performance.now();
+  let destroyed = false;
+  const assets = new Assets(renderer);
+  const ready = (async () => {
+    const progress = new Progress(data.onProgress);
+    progress.add(1);
+    await assets.loadManifest();
+    progress.finish(1, 'file list');
+    const mats = await buildMaterials(assets, builtQuality, progress, renderer.capabilities.getMaxAnisotropy());
+    const BUILD = 400_000;
+    progress.add(BUILD);
+    const m = await buildMansion(layout, mats, assets, progress);
+    if (destroyed) return;
+    mansion = m;
+    scene.add(m.group);
+    for (const id of data.openDoors) {
+      m.setDoor(id, true);
+      world.mover.setDoor(id, true);
+    }
+    m.update(10); // doors that are already open: snap them open
+    ghosts = new Ghosts(scene, layout, assets, data.ghostSpots);
+    const ac = voice.audioContext();
+    if (ac) sound = new Soundscape(ac, assets, layout);
+    applyQuality();
+    renderer.compile(scene, camera); // build shaders now, not on the first frames
+    progress.finish(BUILD, 'house built');
+    if (hasPointerLock) data.onLockChange?.(false);
+    last = performance.now();
+    raf = requestAnimationFrame(frame);
+  })();
+
+  // ---------- doors ----------
+  let promptDoor: string | null = null;
+  function nearestDoor() {
+    const fx = -Math.sin(world.yaw);
+    const fz = -Math.cos(world.yaw);
+    let best: { id: string; d: number; locked: boolean; label: string; open: boolean } | null = null;
+    for (const d of layout.doors) {
+      if (d.type !== 'door' || Math.abs(d.y - world.ly) > 1.5) continue;
+      const dx = d.cx - world.lx;
+      const dz = d.cz - world.lz;
+      const dist = Math.hypot(dx, dz);
+      if (dist > DOOR_REACH) continue;
+      if (dist > 0.6 && (dx * fx + dz * fz) / dist < 0.35) continue; // must be roughly in front of you
+      if (!best || dist < best.d) best = { id: d.id, d: dist, locked: d.locked, label: d.label, open: !!mansion?.doors.get(d.id)?.open };
+    }
+    return best;
+  }
+  function interact() {
+    const d = nearestDoor();
+    if (!d) return;
+    if (d.locked) {
+      const door = layout.doors.find((x) => x.id === d.id)!;
+      sound?.doorLocked(door.cx, door.y + 1, door.cz);
+      data.onLocked(d.label);
+    } else data.requestDoor(d.id);
+  }
+
+  // ---------- the game loop ----------
   let sendTimer = 0;
   let lastSent = '';
+  let fps = 60;
+  let perfTimer = 0;
+  let perfFrames = 0;
+  let stepDist = 0;
+  let prevX = world.lx;
+  let prevZ = world.lz;
+  const dir = new THREE.Vector3();
 
   function frame(nowMs: number) {
     raf = requestAnimationFrame(frame);
+    if (!mansion || !post) return;
     const dtMs = Math.min(nowMs - last, 100);
     last = nowMs;
-    const dt = dtMs / 1000;
-    if (dtMs > 0) world.fps = world.fps * 0.9 + (1000 / dtMs) * 0.1;
+    const dt = Math.max(0, dtMs) / 1000;
+    renderer.info.reset();
 
     // ---- 1. look: touch drag on the right half of the screen ----
     const look = data.consumeLook();
@@ -394,8 +446,8 @@ export function createView(parent: HTMLElement, data: ViewData): ViewHandle {
       iy = Math.round(stick.y * 100);
     }
 
-    // ---- 3. predict: my player moves right away ----
-    if (ix !== 0 || iy !== 0) world.moveMine(ix, iy, dt);
+    // ---- 3. predict: my player moves right away (gravity too, so always step) ----
+    world.moveMine(ix, iy, dt);
 
     // ---- 4. tell the server 20 times per second (when moving, looking, or just stopped) ----
     sendTimer += dtMs;
@@ -406,54 +458,149 @@ export function createView(parent: HTMLElement, data: ViewData): ViewHandle {
       lastSent = sig;
     }
 
-    // ---- 5. camera = my eyes ----
-    camera.position.set(world.lx, EYE_HEIGHT, world.lz);
+    // ---- 5. camera = my eyes (with a gentle head bob while walking) ----
+    const moved = Math.hypot(world.lx - prevX, world.lz - prevZ);
+    prevX = world.lx;
+    prevZ = world.lz;
+    walkPhase += moved * 3.2;
+    const bob = moved > 0.001 ? 1 : 0;
+    camera.position.set(world.lx, world.ly + EYE_HEIGHT + Math.abs(Math.sin(walkPhase)) * 0.025 * bob, world.lz);
     camera.rotation.set(world.pitch, world.yaw, 0);
+    stepDist += moved;
+    if (stepDist > 0.75) {
+      stepDist = 0;
+      sound?.footstep(world.lx, world.ly, world.lz, true);
+    }
 
-    // ---- 6. other players: add / remove / glide ----
+    // ---- 6. my flashlight: lags a little behind your view and sways as you walk ----
+    const lag = 1 - Math.exp(-dt * 14);
+    aimYaw += wrap(world.yaw - aimYaw) * lag;
+    aimPitch += (world.pitch - aimPitch) * lag;
+    const swayY = aimYaw + Math.sin(walkPhase) * 0.018 * bob;
+    const swayP = aimPitch + Math.cos(walkPhase * 2) * 0.012 * bob;
+    dir.set(-Math.sin(swayY) * Math.cos(swayP), Math.sin(swayP), -Math.cos(swayY) * Math.cos(swayP));
+    const rx = Math.cos(world.yaw);
+    const rz = -Math.sin(world.yaw);
+    flash.position.set(camera.position.x + rx * 0.2, camera.position.y - 0.22, camera.position.z + rz * 0.2);
+    flashTarget.position.copy(flash.position).addScaledVector(dir, 6);
+    // it flickers when a ghost is near
+    const gd = ghosts?.nearestDistance(world.lx, world.ly, world.lz) ?? Infinity;
+    flash.intensity = FLASH_POWER * flicker(gd, nowMs);
+
+    // ---- 7. other players: add / remove / glide / footsteps / their flashlights ----
     for (const [slot, a] of avatars) {
       if (!world.infos.has(slot)) {
         scene.remove(a.group);
         avatars.delete(slot);
-        a.group.traverse((o) => {
-          const m = o as THREE.Mesh;
-          m.geometry?.dispose?.();
-        });
       }
     }
     const now = performance.now();
-    const t = now / 1000;
+    const close: { a: Avatar3D; d: number; gd: number }[] = [];
     for (const info of world.infos.values()) {
       if (info.s === world.me) continue;
       let a = avatars.get(info.s);
       if (!a) {
-        a = buildAvatar(info.a, info.n);
+        a = Object.assign(buildAvatar(info.a, info.n, assets), { stepDist: 0, lastX: info.x, lastZ: info.z });
         avatars.set(info.s, a);
         scene.add(a.group);
-        applyQuality(); // give the new flashlight shadows (if allowed)
       }
       const st = world.stateOf(info.s, now);
       if (!st) continue;
-      a.group.position.set(st.x, 0, st.z);
+      a.group.position.set(st.x, st.y, st.z);
       a.group.rotation.y = st.yaw;
       a.pivot.rotation.x = st.pitch;
-      a.update(t);
-
-      // ---- 7. proximity voice: closer = louder, far = silent ----
-      const d = Math.hypot(st.x - world.lx, st.z - world.lz);
+      a.update(now / 1000);
+      a.stepDist += Math.hypot(st.x - a.lastX, st.z - a.lastZ);
+      a.lastX = st.x;
+      a.lastZ = st.z;
+      if (a.stepDist > 0.75) {
+        a.stepDist = 0;
+        sound?.footstep(st.x, st.y, st.z, false);
+      }
+      const d = Math.hypot(st.x - world.lx, (st.y - world.ly) * 1.5, st.z - world.lz);
+      close.push({ a, d, gd: ghosts?.nearestDistance(st.x, st.y, st.z) ?? Infinity });
+      // proximity voice: closer = louder, far = silent
       const vol = d <= HEAR_FULL ? 1 : d >= HEAR_MAX ? 0 : Math.pow(1 - (d - HEAR_FULL) / (HEAR_MAX - HEAR_FULL), 2);
       voice.setVolume(info.s, vol);
       a.talk.visible = voice.isSpeaking(info.s);
     }
+    close.sort((p, q) => p.d - q.d);
+    pool.forEach((l, i) => {
+      const c = close[i];
+      if (!c || c.d > 25) {
+        l.intensity = 0;
+        return;
+      }
+      c.a.group.updateMatrixWorld();
+      c.a.lamp.getWorldPosition(l.position);
+      c.a.aim.getWorldPosition(l.target.position);
+      l.intensity = 70 * flicker(c.gd, nowMs + i * 777);
+    });
 
-    renderer.render(scene, camera);
+    // ---- 8. the house, ghosts, sounds ----
+    mansion.update(dt);
+    ghosts?.update(dt, camera);
+    sound?.setListener(world.lx, world.ly, world.lz, world.yaw);
+    sound?.update(gd);
+    const near = nearestDoor();
+    const promptKey = near ? `${near.id}:${near.open}:${near.locked}` : null;
+    if (promptKey !== promptDoor) {
+      promptDoor = promptKey;
+      data.onPrompt(near ? (near.locked ? 'Try the door' : near.open ? 'Close door' : 'Open door') : null);
+    }
+
+    post.render(dt);
+
+    // ---- 9. keep it smooth: lower the resolution a bit if the phone struggles ----
+    perfTimer += dtMs;
+    perfFrames++;
+    if (perfTimer > 2000) {
+      fps = (perfFrames * 1000) / perfTimer;
+      if (fps < 40 && dynScale > 0.6) {
+        dynScale -= 0.1;
+        resize();
+      } else if (fps > 57 && dynScale < 1) {
+        dynScale = Math.min(1, dynScale + 0.05);
+        resize();
+      }
+      perfTimer = 0;
+      perfFrames = 0;
+    }
   }
 
-  applyQuality();
-  raf = requestAnimationFrame(frame);
+  /** 1 = steady. Near a ghost the light stutters and sometimes nearly dies. */
+  function flicker(ghostDist: number, t: number): number {
+    if (ghostDist > 7) return 1;
+    const k = 1 - ghostDist / 7;
+    const wobble = 0.5 + 0.5 * Math.sin(t * 0.037 + Math.sin(t * 0.013) * 3);
+    let v = 1 - k * 0.55 * wobble;
+    if (Math.random() < k * 0.08) v *= 0.08; // sudden drop-out
+    return v;
+  }
 
   return {
+    ready,
+    setDoor(id: string, open: boolean, withSound: boolean) {
+      world.mover.setDoor(id, open);
+      if (!mansion) return;
+      mansion.setDoor(id, open);
+      const d = layout.doors.find((x) => x.id === id);
+      if (d && withSound) sound?.doorCreak(d.cx, d.y + 1.2, d.cz);
+    },
+    setGhost(i: number, spot: number) {
+      ghosts?.set(i, spot);
+    },
+    interact,
+    stats: () => ({
+      fps,
+      calls: renderer.info.render.calls,
+      triangles: renderer.info.render.triangles,
+      pixelRatio: renderer.getPixelRatio(),
+      quality: settings.quality,
+      where: `${world.lx.toFixed(1)}, ${world.ly.toFixed(1)}, ${world.lz.toFixed(1)} (${roomAt(layout, world.lx, world.ly + 0.1, world.lz)?.name ?? 'outside?'})`,
+    }),
     destroy() {
+      destroyed = true;
       cancelAnimationFrame(raf);
       stopListening();
       window.removeEventListener('keydown', onKeyDown);
@@ -463,7 +610,14 @@ export function createView(parent: HTMLElement, data: ViewData): ViewHandle {
       window.removeEventListener('resize', resize);
       canvas.removeEventListener('click', onCanvasClick);
       document.removeEventListener('pointerlockchange', onLockChange);
+      canvas.removeEventListener('webglcontextlost', onContextLost);
+      canvas.removeEventListener('webglcontextrestored', onContextRestored);
       if (document.pointerLockElement === canvas) document.exitPointerLock();
+      sound?.dispose();
+      ghosts?.dispose();
+      mansion?.dispose();
+      post?.dispose();
+      assets.dispose();
       renderer.dispose();
       canvas.remove();
     },

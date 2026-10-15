@@ -5,7 +5,7 @@
     <!-- viewport-fit + no zoom: makes the page behave like an app on phones -->
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
     <meta name="theme-color" content="#0b0b10" />
-    <title>Dark Hunt</title>
+    <title>Dark Hunt - Blackwood Manor</title>
   </head>
   <body>
     <!-- The Phaser game draws into this box -->
@@ -72,8 +72,22 @@
       <div id="hudHint">🎧 Use headphones to avoid echo</div>
     </div>
 
+    <!-- Loading the mansion (textures, models) -->
+    <div id="assetLoading" class="screen hidden">
+      <div class="card center">
+        <h2>🕯️ Entering Blackwood Manor...</h2>
+        <div class="loadbar"><div id="loadBarFill"></div></div>
+        <p id="loadBarText" class="small">0%</p>
+        <p class="small">🎧 Headphones make it much scarier (and stop echo).</p>
+      </div>
+    </div>
+
+    <!-- "Open door" hint (computer) and use button (phone) -->
+    <div id="prompt" class="hidden"><span id="promptText"></span></div>
+    <button id="useBtn" class="hidden">✋</button>
+
     <!-- Desktop: shown until the mouse is captured for looking around -->
-    <div id="lockHint" class="hidden">🖱️ Click the game to look around<br /><small>WASD = move · Esc = free the mouse</small></div>
+    <div id="lockHint" class="hidden">🖱️ Click the game to look around<br /><small>WASD = move · E = open doors · Esc = free the mouse</small></div>
 
     <!-- Settings -->
     <div id="settings" class="hidden">
@@ -82,7 +96,12 @@
       <input id="sensInput" type="range" min="0.2" max="3" step="0.1" value="1" />
       <label for="fovInput">Field of view <b id="fovVal">75°</b></label>
       <input id="fovInput" type="range" min="50" max="110" step="1" value="75" />
-      <label class="check"><input id="lowInput" type="checkbox" /> Low graphics (turns off shadows — faster on budget phones)</label>
+      <label>Graphics quality</label>
+      <div class="quality">
+        <label><input type="radio" name="quality" value="low" /> Low<small>no shadows or effects, small textures - budget phones</small></label>
+        <label><input type="radio" name="quality" value="medium" /> Medium<small>flashlight shadows, film effects - most phones</small></label>
+        <label><input type="radio" name="quality" value="high" /> High<small>everything, sharpest - computers</small></label>
+      </div>
       <button id="settingsClose" class="primary">Done</button>
     </div>
 

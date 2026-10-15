@@ -73,6 +73,11 @@ export class Voice {
     }
   }
 
+  /** The shared audio engine (also used for the game's sound effects). */
+  audioContext(): AudioContext | null {
+    return this.ac;
+  }
+
   /** Ask for the microphone. Returns true if we got it. */
   async requestMic(): Promise<boolean> {
     if (!navigator.mediaDevices?.getUserMedia) {

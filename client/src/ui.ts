@@ -3,10 +3,11 @@
 // Small on-screen helpers made of plain HTML:
 //   - Joystick   : left-thumb touch stick for phones (move)
 //   - LookPad    : drag on the right half of the screen to look around (phones)
-//   - Settings   : look sensitivity, field of view, low-graphics (saved on the device)
-//   - DebugPanel : errors, connection status, ping, FPS, player count
+//   - Settings   : look sensitivity, field of view, quality preset (saved on the device)
+//   - DebugPanel : errors, connection status, ping, FPS, download size, player count
 //   - toast()    : short pop-up messages ("Sam joined")
 // =====================================================================
+import type { Quality } from './materials';
 
 /** True on phones/tablets (touch screens). */
 export function isTouchDevice(): boolean {
@@ -130,14 +131,21 @@ export class LookPad {
 export class Settings {
   sens = 1; // look sensitivity multiplier (0.2 - 3)
   fov = 75; // field of view in degrees (50 - 110)
-  lowGfx = false; // low graphics = shadows off (for budget phones)
+  // Low = no shadows, no effects, small textures (budget phones)
+  // Medium = flashlight shadow, light effects (default on phones)
+  // High = everything, full resolution (default on computers)
+  quality: Quality = isTouchDevice() ? 'medium' : 'high';
   private listeners: (() => void)[] = [];
 
   constructor() {
     try {
-      const raw = localStorage.getItem('dh_settings');
-      if (raw) Object.assign(this, JSON.parse(raw));
-      else this.lowGfx = isTouchDevice(); // phones start in low-graphics mode; turn it off in ⚙️ if yours is fast
+      const saved = JSON.parse(localStorage.getItem('dh_settings') ?? 'null');
+      if (saved) {
+        if (typeof saved.sens === 'number') this.sens = saved.sens;
+        if (typeof saved.fov === 'number') this.fov = saved.fov;
+        if (['low', 'medium', 'high'].includes(saved.quality)) this.quality = saved.quality;
+        else if (saved.lowGfx === true) this.quality = 'low'; // older saved setting
+      }
     } catch {
       /* storage blocked: use defaults */
     }
@@ -149,10 +157,10 @@ export class Settings {
     return () => (this.listeners = this.listeners.filter((f) => f !== fn));
   }
 
-  update(patch: Partial<Pick<Settings, 'sens' | 'fov' | 'lowGfx'>>) {
+  update(patch: Partial<Pick<Settings, 'sens' | 'fov' | 'quality'>>) {
     Object.assign(this, patch);
     try {
-      localStorage.setItem('dh_settings', JSON.stringify({ sens: this.sens, fov: this.fov, lowGfx: this.lowGfx }));
+      localStorage.setItem('dh_settings', JSON.stringify({ sens: this.sens, fov: this.fov, quality: this.quality }));
     } catch {
       /* ignore */
     }

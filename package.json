@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "npm run build:client && npm run build:server",
-    "build:client": "vite build --config vite.config.mts",
+    "build:client": "vite build --config vite.config.mts && node scripts/build-assets.mjs",
     "build:server": "tsc -p tsconfig.server.json",
     "start": "node dist/server/server/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit"
@@ -16,13 +16,22 @@
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.14.0",
     "express": "^4.19.2",
+    "postprocessing": "^6.36.4",
     "socket.io": "^4.7.5",
     "three": "^0.160.1"
   },
   "devDependencies": {
+    "@gltf-transform/core": "^4.1.1",
+    "@gltf-transform/extensions": "^4.1.1",
+    "@gltf-transform/functions": "^4.1.1",
     "@types/express": "^4.17.21",
     "@types/node": "^20.14.0",
     "@types/three": "^0.160.0",
+    "draco3dgltf": "^1.5.7",
+    "fflate": "^0.8.2",
+    "ktx2-encoder": "^0.6.0",
+    "meshoptimizer": "^0.22.0",
+    "sharp": "^0.33.5",
     "socket.io-client": "^4.7.5",
     "typescript": "^5.5.4",
     "vite": "^5.4.2"

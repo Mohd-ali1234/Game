@@ -136,3 +136,21 @@ button.primary { background: #8c2f39; border-color: #b8434f; font-weight: bold; 
 #settings input[type='range'] { width: 100%; padding: 0; height: 28px; }
 #settings label.check { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; color: #ddd; margin-top: 14px; }
 #settings label.check input { width: 22px; height: 22px; flex: none; padding: 0; }
+
+/* ---------- mansion: loading bar, door prompt, use button, quality picker ---------- */
+#assetLoading { z-index: 25; }
+.loadbar { height: 12px; border-radius: 6px; background: #2a2a36; overflow: hidden; margin: 16px 0 6px; }
+#loadBarFill { height: 100%; width: 0; background: linear-gradient(90deg, #8c2f39, #d9a441); transition: width 0.25s; }
+#prompt {
+  position: fixed; z-index: 11; left: 50%; top: 58%; transform: translateX(-50%); pointer-events: none;
+  background: #000a; color: #f0e2c0; padding: 6px 14px; border-radius: 8px; font-size: 15px; letter-spacing: 0.5px;
+}
+#useBtn {
+  position: fixed; z-index: 16; width: 76px; height: 76px; margin: 0; padding: 0; border-radius: 50%; font-size: 34px;
+  right: calc(26px + env(safe-area-inset-right)); bottom: calc(110px + env(safe-area-inset-bottom));
+  background: rgba(140, 47, 57, 0.75); border: 2px solid rgba(255, 220, 180, 0.6);
+}
+.quality { display: flex; flex-direction: column; gap: 6px; }
+.quality label { display: block; margin: 0; padding: 8px 10px; border-radius: 8px; background: #0e0e14; border: 1px solid #2a2a3a; color: #eee; font-size: 15px; }
+.quality input { width: auto; margin-right: 6px; }
+.quality small { display: block; color: #8b8ba0; font-size: 12px; margin-left: 22px; }

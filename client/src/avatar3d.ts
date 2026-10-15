@@ -8,7 +8,8 @@
 import * as THREE from 'three';
 import { PLAYER_RADIUS } from '../../shared/game';
 import { AVATARS } from './avatars';
-import { loadAvatarModel } from './models';
+import type { Assets } from './assets';
+import { avatarModelKey, fitModel } from './models';
 
 const BODY_LEN = 0.9; // capsule cylinder part; total height = 0.9 + 2 x 0.35 = 1.6
 const HEAD_TOP = BODY_LEN + 2 * PLAYER_RADIUS + 0.05; // y of the top of the head (~1.65)
@@ -113,16 +114,17 @@ function makeSprite(draw: (ctx: CanvasRenderingContext2D, w: number, h: number) 
 export interface Avatar3D {
   group: THREE.Group; // put this at the player's feet; rotate Y = where they face
   pivot: THREE.Group; // head/flashlight pivot: rotate X = look up/down
-  spot: THREE.SpotLight; // the flashlight
+  lamp: THREE.Object3D; // where their flashlight is (a shared spotlight is moved here when they're close)
+  aim: THREE.Object3D; // a point the flashlight points at
   beam: THREE.Mesh; // faint visible beam so you can spot flashlights from afar
   talk: THREE.Sprite; // "speaking" icon
   update(timeSeconds: number): void;
 }
 
-export const FLASH_ANGLE = 0.5; // flashlight cone half-angle (radians)
-export const FLASH_RANGE = 22; // how far the flashlight reaches (meters)
+export const FLASH_ANGLE = 0.46; // flashlight cone half-angle (radians)
+export const FLASH_RANGE = 24; // how far the flashlight reaches (meters)
 
-export function buildAvatar(avatarIndex: number, name: string): Avatar3D {
+export function buildAvatar(avatarIndex: number, name: string, assets?: Assets): Avatar3D {
   const def = AVATARS[avatarIndex % AVATARS.length];
   const group = new THREE.Group();
 
@@ -146,13 +148,15 @@ export function buildAvatar(avatarIndex: number, name: string): Avatar3D {
   body.add(hat);
   group.add(body);
 
-  // Swap in a .glb model if the owner configured one (see models.ts)
-  void loadAvatarModel(avatarIndex).then((model) => {
-    if (model) {
+  // Swap in a .glb model if one was uploaded (models/avatar_0.glb ... avatar_7.glb)
+  const key = assets && avatarModelKey(assets, avatarIndex);
+  if (assets && key) {
+    void assets.model(key).then((src) => {
+      if (!src) return;
       group.remove(body);
-      group.add(model);
-    }
-  });
+      group.add(fitModel(src, [0.7, 1.65, 0.5], key));
+    });
+  }
 
   // ----- flashlight in hand: pivots up/down with the player's pitch -----
   const pivot = new THREE.Group();
@@ -166,12 +170,11 @@ export function buildAvatar(avatarIndex: number, name: string): Avatar3D {
   lens.position.z = -0.215;
   pivot.add(torch, lens);
 
-  const spot = new THREE.SpotLight(0xdfe8ff, 45, FLASH_RANGE, FLASH_ANGLE, 0.45, 2);
-  spot.position.set(0, 0, -0.2);
-  const target = new THREE.Object3D();
-  target.position.set(0, 0, -5);
-  pivot.add(spot, target);
-  spot.target = target;
+  const lamp = new THREE.Object3D();
+  lamp.position.set(0, 0, -0.2);
+  const aim = new THREE.Object3D();
+  aim.position.set(0, 0, -5);
+  pivot.add(lamp, aim);
 
   // faint visible beam (a see-through cone) - lets you see other players' flashlight beams
   const len = 9;
@@ -180,9 +183,9 @@ export function buildAvatar(avatarIndex: number, name: string): Avatar3D {
   coneGeo.rotateX(Math.PI / 2); // point along -Z
   const beam = new THREE.Mesh(
     coneGeo,
-    new THREE.MeshBasicMaterial({ color: 0xcfe0ff, transparent: true, opacity: 0.045, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending, fog: false }),
+    new THREE.MeshBasicMaterial({ color: 0xffd28a, transparent: true, opacity: 0.035, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending, fog: false }),
   );
-  beam.position.copy(spot.position);
+  beam.position.copy(lamp.position);
   pivot.add(beam);
 
   // ----- name tag and speaking icon -----
@@ -217,7 +220,7 @@ export function buildAvatar(avatarIndex: number, name: string): Avatar3D {
   group.add(talk);
 
   return {
-    group, pivot, spot, beam, talk,
+    group, pivot, lamp, aim, beam, talk,
     update(t: number) {
       const prop = hat.getObjectByName('propeller');
       if (prop) prop.rotation.y = t * 12; // the propeller hat spins!

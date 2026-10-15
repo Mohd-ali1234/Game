@@ -5,7 +5,8 @@
 // =====================================================================
 import './style.css';
 import { io } from 'socket.io-client';
-import { MAX_PLAYERS, Mover } from '../../shared/game';
+import { initPhysics, LAYOUT, MAX_PLAYERS, Mover } from '../../shared/game';
+import { formatMB, totalDownloaded } from './assets';
 import { AVATARS, avatarCanvas } from './avatars';
 import { createView, PlayerInfo, ViewHandle, World } from './game';
 import { DebugPanel, isTouchDevice, Joystick, LookPad, Settings, toast } from './ui';
@@ -13,6 +14,7 @@ import { Voice } from './voice';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const show = (el: HTMLElement, on: boolean) => el.classList.toggle('hidden', !on);
+const TEST_HOOK = location.hash === '#test'; // automated tests open the page with #test
 
 interface JoinReply {
   ok: boolean;
@@ -21,6 +23,8 @@ interface JoinReply {
   slot: number;
   token: string;
   players: PlayerInfo[];
+  doors: string[]; // doors that are open
+  ghosts: number[]; // where each ghost is (-1 = vanished)
 }
 
 // ---------- debug panel first, so it catches every error ----------
@@ -40,7 +44,6 @@ joystick.show(false);
 const lookPad = new LookPad($('joyArea'));
 lookPad.show(false);
 const settings = new Settings();
-let mover: Mover | null = null; // Rapier physics (WebAssembly), loaded once when you first enter a room
 
 let world: World | null = null;
 let gameHandle: ViewHandle | null = null;
@@ -167,25 +170,49 @@ async function enterRoom(res: JoinReply) {
   history.replaceState(null, '', `?room=${res.code}`);
   $('roomCode').textContent = res.code;
 
-  mover ??= await Mover.create(); // same physics as the server, so movement prediction matches
+  await initPhysics(); // same Rapier physics as the server, so movement prediction matches
   if (!session) return; // we left while the physics were loading
+  const mover = new Mover(LAYOUT); // this room's own copy (doors open/close per room)
   world = new World(res.slot, res.players, mover, (seq, ix, iy, yaw, pitch) =>
     socket.emit('in', [seq, ix, iy, Math.round(yaw * 1000), Math.round(pitch * 1000)]),
   );
   show($('lobby'), false);
-  show($('hud'), true);
+  // loading bar while textures/models download and the house is built
+  setLoadingBar(0, '');
+  show($('assetLoading'), true);
   const touch = isTouchDevice();
-  joystick.show(touch);
-  lookPad.show(touch);
-  gameHandle = createView($('game'), {
+  const view = createView($('game'), {
     world,
+    layout: LAYOUT,
     voice,
     settings,
+    openDoors: res.doors,
+    ghostSpots: res.ghosts,
     getStick: () => joystick,
     consumeLook: () => lookPad.consume(),
     onLockChange: (locked) => show($('lockHint'), !locked && !touch),
+    onProgress: setLoadingBar,
+    onPrompt: (text) => {
+      $('promptText').textContent = text ? (touch ? text : `[E] ${text}`) : '';
+      show($('prompt'), !!text && !touch);
+      show($('useBtn'), !!text && touch);
+    },
+    requestDoor: (id) => socket.emit('door', id),
+    onLocked: (msg) => toast(msg),
   });
+  gameHandle = view;
+  if (TEST_HOOK) (window as unknown as { __test: unknown }).__test = { world }; // hook for automated tests only
   connectVoiceToEveryone(res.players);
+  try {
+    await view.ready;
+  } catch (e) {
+    console.error('Loading failed: ' + e);
+  }
+  if (gameHandle !== view) return; // left while loading
+  show($('assetLoading'), false);
+  show($('hud'), true);
+  joystick.show(touch);
+  lookPad.show(touch);
   refreshMuteButton();
   toast(voice.micState === 'on' ? 'Voice chat on - use headphones 🎧' : 'Playing without a microphone');
 }
@@ -203,6 +230,9 @@ function rejoin() {
   socket.timeout(8000).emit('rejoin', { code: session.code, token: session.token }, (err: Error | null, res: JoinReply) => {
     if (err || !res?.ok) return leaveRoom(res?.err ?? 'Could not reconnect to the room.');
     world?.resync(res.players);
+    const open = new Set(res.doors);
+    for (const d of LAYOUT.doors) if (d.type === 'door') gameHandle?.setDoor(d.id, open.has(d.id), false);
+    res.ghosts.forEach((spot, i) => gameHandle?.setGhost(i, spot));
     connectVoiceToEveryone(res.players);
     toast('Reconnected!');
   });
@@ -218,6 +248,9 @@ function leaveRoom(message = '') {
   joystick.show(false);
   lookPad.show(false);
   show($('hud'), false);
+  show($('assetLoading'), false);
+  show($('useBtn'), false);
+  show($('prompt'), false);
   show($('lockHint'), false);
   show($('settings'), false);
   show($('banner'), false);
@@ -243,6 +276,15 @@ socket.on('pl', (slot: number) => {
   if (name) toast(`${name} left`);
 });
 socket.on('sig', (m: { from: number; d: unknown }) => void voice.handleSignal(m.from, m.d));
+socket.on('door', ([id, open]: [string, number]) => gameHandle?.setDoor(id, !!open, true));
+socket.on('gh', ([i, spot]: [number, number]) => gameHandle?.setGhost(i, spot));
+
+function setLoadingBar(fraction: number, label: string) {
+  $('loadBarFill').style.width = Math.round(fraction * 100) + '%';
+  $('loadBarText').textContent = `${Math.round(fraction * 100)}%  ·  ${formatMB(totalDownloaded())} downloaded`;
+  if (label) debug.set('loading', label);
+}
+$('useBtn').addEventListener('click', () => gameHandle?.interact());
 
 // ---------- HUD buttons ----------
 function refreshMuteButton() {
@@ -263,14 +305,14 @@ $('muteBtn').addEventListener('click', () => {
 });
 $('debugBtn').addEventListener('click', () => debug.toggle());
 
-// ---------- settings panel: look sensitivity, field of view, low graphics ----------
+// ---------- settings panel: look sensitivity, field of view, quality ----------
 const sensInput = $<HTMLInputElement>('sensInput');
 const fovInput = $<HTMLInputElement>('fovInput');
-const lowInput = $<HTMLInputElement>('lowInput');
+const qualityInputs = [...document.querySelectorAll<HTMLInputElement>('input[name="quality"]')];
 function showSettingsValues() {
   sensInput.value = String(settings.sens);
   fovInput.value = String(settings.fov);
-  lowInput.checked = settings.lowGfx;
+  for (const q of qualityInputs) q.checked = q.value === settings.quality;
   $('sensVal').textContent = settings.sens.toFixed(1) + 'x';
   $('fovVal').textContent = settings.fov + '°';
 }
@@ -283,7 +325,13 @@ fovInput.addEventListener('input', () => {
   settings.update({ fov: Number(fovInput.value) });
   showSettingsValues();
 });
-lowInput.addEventListener('change', () => settings.update({ lowGfx: lowInput.checked }));
+for (const q of qualityInputs) {
+  q.addEventListener('change', () => {
+    if (!q.checked) return;
+    settings.update({ quality: q.value as Settings['quality'] });
+    if (session) toast('Shadows & effects changed. Texture size changes the next time you join.');
+  });
+}
 $('settingsBtn').addEventListener('click', () => {
   const panel = $('settings');
   show(panel, panel.classList.contains('hidden'));
@@ -317,7 +365,14 @@ setInterval(() => {
 }, 2000);
 setInterval(() => {
   debug.set('ping', socket.connected ? ping + ' ms' : '-');
-  debug.set('fps', world ? Math.round(world.fps) : '-');
+  const st = gameHandle?.stats();
+  debug.set('fps', st ? Math.round(st.fps) : '-');
+  debug.set('download', formatMB(totalDownloaded()));
+  if (st) {
+    debug.set('quality', `${st.quality} @${st.pixelRatio.toFixed(2)}x`);
+    debug.set('draws', `${st.calls} (${Math.round(st.triangles / 1000)}k tris)`);
+    debug.set('pos', st.where);
+  }
   debug.set('players', world ? `${world.infos.size}/${MAX_PLAYERS}` : 0);
   debug.set('mic', voice.micState + (voice.muted ? ' (muted)' : ''));
   if (world) $('playerCount').textContent = String(world.infos.size);
