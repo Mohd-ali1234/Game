@@ -135,6 +135,7 @@ export class Settings {
   // Medium = flashlight shadow, light effects (default on phones)
   // High = everything, full resolution (default on computers)
   quality: Quality = isTouchDevice() ? 'medium' : 'high';
+  qualityChosen = false; // true once the player picks a preset (then we never change it for them)
   private listeners: (() => void)[] = [];
 
   constructor() {
@@ -145,6 +146,7 @@ export class Settings {
         if (typeof saved.fov === 'number') this.fov = saved.fov;
         if (['low', 'medium', 'high'].includes(saved.quality)) this.quality = saved.quality;
         else if (saved.lowGfx === true) this.quality = 'low'; // older saved setting
+        this.qualityChosen = saved.qualityChosen === true;
       }
     } catch {
       /* storage blocked: use defaults */
@@ -157,10 +159,10 @@ export class Settings {
     return () => (this.listeners = this.listeners.filter((f) => f !== fn));
   }
 
-  update(patch: Partial<Pick<Settings, 'sens' | 'fov' | 'quality'>>) {
+  update(patch: Partial<Pick<Settings, 'sens' | 'fov' | 'quality' | 'qualityChosen'>>) {
     Object.assign(this, patch);
     try {
-      localStorage.setItem('dh_settings', JSON.stringify({ sens: this.sens, fov: this.fov, quality: this.quality }));
+      localStorage.setItem('dh_settings', JSON.stringify({ sens: this.sens, fov: this.fov, quality: this.quality, qualityChosen: this.qualityChosen }));
     } catch {
       /* ignore */
     }

@@ -199,6 +199,10 @@ async function enterRoom(res: JoinReply) {
     },
     requestDoor: (id) => socket.emit('door', id),
     onLocked: (msg) => toast(msg),
+    onNotice: (msg) => {
+      toast(msg);
+      showSettingsValues();
+    },
   });
   gameHandle = view;
   if (TEST_HOOK) (window as unknown as { __test: unknown }).__test = { world }; // hook for automated tests only
@@ -328,7 +332,7 @@ fovInput.addEventListener('input', () => {
 for (const q of qualityInputs) {
   q.addEventListener('change', () => {
     if (!q.checked) return;
-    settings.update({ quality: q.value as Settings['quality'] });
+    settings.update({ quality: q.value as Settings['quality'], qualityChosen: true });
     if (session) toast('Shadows & effects changed. Texture size changes the next time you join.');
   });
 }

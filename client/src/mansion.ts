@@ -39,7 +39,7 @@ export interface Mansion {
   dispose(): void;
 }
 
-const SEG = 0.6; // geometry detail for baked light (one vertex every 60 cm)
+const SEG = 0.9; // geometry detail for baked light (one vertex every 90 cm - fewer triangles for phones)
 
 // ---------- baked lighting ----------
 function bakeInto(geo: THREE.BufferGeometry, lights: BakeLight[], ambient: THREE.Color) {
@@ -213,7 +213,7 @@ export async function buildMansion(layout: Layout, mats: Record<string, THREE.Ma
         // carpet runner on each step
         const rw = W * 0.65;
         const cg = alongX ? new THREE.BoxGeometry(run + 0.01, 0.015, rw) : new THREE.BoxGeometry(rw, 0.015, run + 0.01);
-        cg.translate(alongX ? a : mid, s.y0 + h + 0.007, alongX ? mid : a);
+        cg.translate(alongX ? a : mid, s.y0 + h + 0.012, alongX ? mid : a);
         const uv = cg.attributes.uv as THREE.BufferAttribute;
         for (let k = 0; k < uv.count; k++) uv.setXY(k, uv.getX(k), uv.getY(k) * 0.3 + i * 0.3);
         add(cg, 'carpet', s.room, { keepUV: true });
@@ -403,7 +403,7 @@ export async function buildMansion(layout: Layout, mats: Record<string, THREE.Ma
       quad(quads.patches, fn(bl, near).setY(floorY), fn(br, near).setY(floorY), fn(br, reach).setY(floorY), fn(bl, reach).setY(floorY));
     }
     if (p.type === 'wall_lamp') {
-      const c = new THREE.Vector3(p.x, p.y + 0.25, p.z).addScaledVector(fwd, -p.size[2] / 2 + 0.01);
+      const c = new THREE.Vector3(p.x, p.y + 0.25, p.z).addScaledVector(fwd, -p.size[2] / 2 + 0.04); // a few cm off the wall: no flicker
       const s = 0.7;
       quad(quads.halos, c.clone().addScaledVector(right, -s).setY(c.y - s), c.clone().addScaledVector(right, s).setY(c.y - s), c.clone().addScaledVector(right, s).setY(c.y + s), c.clone().addScaledVector(right, -s).setY(c.y + s));
     }
@@ -429,7 +429,7 @@ export async function buildMansion(layout: Layout, mats: Record<string, THREE.Ma
     group.add(m);
   };
   const additive = (map: THREE.Texture, color: string, opacity: number) =>
-    new THREE.MeshBasicMaterial({ map, color, transparent: true, opacity, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide });
+    new THREE.MeshBasicMaterial({ map, color, transparent: true, opacity, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
   const shaft = shaftTexture();
   quadMesh(quads.shafts, additive(shaft, '#8fa6d8', 0.07), true);
   quadMesh(quads.patches, additive(windowPatchTexture(), '#8fa6d8', 0.32), false);

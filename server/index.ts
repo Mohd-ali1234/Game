@@ -9,7 +9,7 @@
 //
 // Network messages are tiny arrays to save mobile data:
 //   client -> server  'in'  [seq, ix, iy, yaw*1000, pitch*1000]   my input
-//   server -> clients 'st'  [slot,x,y,z,ack,yaw,pitch, ...]       everyone (20x/sec)
+//   server -> clients 'st'  [tick, slot,x,y,z,ack,yaw,pitch, ...] everyone (20x/sec)
 //   server -> clients 'pj'  {s,n,a,x,y,z,w} a player joined (w = yaw)
 //   server -> clients 'pl'  slot            a player left
 //   client -> server  'door' doorId          "I'm opening/closing this door"
@@ -276,7 +276,10 @@ io.on('connection', (sock) => {
 });
 
 // ---------- the game loop: runs 20 times per second ----------
+let tickNo = 0; // counts server updates; lets browsers space them out evenly
+
 function tick() {
+  tickNo++;
   const now = Date.now();
   for (const room of rooms.values()) {
     let changed = room.dirty;
@@ -310,8 +313,8 @@ function tick() {
       continue;
     }
     if (changed) {
-      // Flat compact array: [slot, x, y, z, ack, yaw, pitch,  slot, x, y, ...]
-      const snap: number[] = [];
+      // Flat compact array: [tick,  slot, x, y, z, ack, yaw, pitch,  slot, x, y, ...]
+      const snap: number[] = [tickNo];
       for (const p of room.players.values()) snap.push(p.slot, r2(p.x), r2(p.y), r2(p.z), p.seq, r2(p.yaw), r2(p.pitch));
       io.to(room.code).volatile.emit('st', snap); // volatile = ok to drop if the network is busy
     }

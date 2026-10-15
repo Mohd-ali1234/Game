@@ -2,7 +2,7 @@
 // client/src/post.ts
 // Post-processing ("camera effects") applied to the whole picture:
 //   bloom on lights, film grain, vignette (dark corners), slight chromatic
-//   aberration (colour fringes at the edges) and a muted, warm colour grade.
+//   aberration (colour fringes at the edges, High only) and a muted, warm colour grade.
 // Uses the "postprocessing" library, which merges all effects into a single
 // pass, so it stays cheap on phones. Quality Low = no effects at all.
 // =====================================================================
@@ -73,17 +73,19 @@ export function createPost(renderer: THREE.WebGLRenderer, scene: THREE.Scene, ca
   composer.addPass(new RenderPass(scene, camera));
 
   const bloom = new BloomEffect({ intensity: high ? 1.1 : 0.9, luminanceThreshold: high ? 0.85 : 0.6, luminanceSmoothing: 0.25, mipmapBlur: true, radius: 0.7 });
-  bloom.resolution.scale = high ? 0.75 : 0.5;
+  bloom.resolution.scale = high ? 0.6 : 0.4;
   const tone = new ToneMappingEffect({ mode: ToneMappingMode.ACES_FILMIC });
   const grade = new GradeEffect();
   const vignette = new VignetteEffect({ offset: 0.28, darkness: 0.72 });
   const noise = new NoiseEffect({ blendFunction: BlendFunction.OVERLAY, premultiply: false });
-  noise.blendMode.opacity.value = high ? 0.18 : 0.14;
-  const chroma = new ChromaticAberrationEffect({ offset: new THREE.Vector2(0.0011, 0.0008), radialModulation: true, modulationOffset: 0.25 });
+  noise.blendMode.opacity.value = high ? 0.09 : 0.06; // subtle: strong grain looks like a glitch on small screens
 
-  // chromatic aberration has to be in its own pass (it re-reads the image)
   composer.addPass(new EffectPass(camera, bloom, tone, grade, vignette, noise));
-  composer.addPass(new EffectPass(camera, chroma));
+  if (high) {
+    // chromatic aberration needs its own full-screen pass, so only on High (computers)
+    const chroma = new ChromaticAberrationEffect({ offset: new THREE.Vector2(0.0006, 0.0004), radialModulation: true, modulationOffset: 0.35 });
+    composer.addPass(new EffectPass(camera, chroma));
+  }
 
   return {
     render: (dt) => composer.render(dt),

@@ -441,7 +441,7 @@ export const BUILDERS: Record<string, Builder> = {
     g.rotateX(-Math.PI / 2);
     const uv = g.attributes.uv as THREE.BufferAttribute;
     for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i), uv.getY(i) * (l / w)); // square pattern repeats along the length
-    k.add(g, 'carpet', 0, 0.006, 0, 0, 0, 0, undefined, true);
+    k.add(g, 'carpet', 0, 0.015, 0, 0, 0, 0, undefined, true); // 1.5 cm above the floor so it never flickers
     // fringe at both ends
     for (const sz of [-1, 1]) k.box('linen', w, 0.008, 0.06, 0, 0, (sz * (l + 0.06)) / 2, { color: '#8a7a60' });
   },

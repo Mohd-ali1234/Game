@@ -106,7 +106,8 @@ function makeSprite(draw: (ctx: CanvasRenderingContext2D, w: number, h: number) 
   draw(c.getContext('2d')!, w, h);
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
-  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, fog: false }));
+  // sizeAttenuation off = always the same size on screen (readable far away, not huge up close)
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, fog: false, sizeAttenuation: false }));
   s.scale.set(scaleX, scaleY, 1);
   return s;
 }
@@ -201,7 +202,7 @@ export function buildAvatar(avatarIndex: number, name: string, assets?: Assets):
       ctx.textBaseline = 'middle';
       ctx.fillText(name, w / 2, h / 2 + 2, w - 20);
     },
-    256, 64, 1.3, 0.325,
+    256, 64, 0.5, 0.125,
   );
   tag.position.y = 2.2;
   group.add(tag);
@@ -213,7 +214,7 @@ export function buildAvatar(avatarIndex: number, name: string, assets?: Assets):
       ctx.textBaseline = 'middle';
       ctx.fillText('🔊', w / 2, h / 2);
     },
-    96, 96, 0.5, 0.5,
+    96, 96, 0.16, 0.16,
   );
   talk.position.y = 2.6;
   talk.visible = false;

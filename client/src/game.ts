@@ -42,7 +42,8 @@ interface Sample {
   pitch: number;
 }
 
-const INTERP_DELAY = 100; // draw other players 100 ms in the past so we always have 2 points to glide between
+const INTERP_DELAY = 120; // draw other players 120 ms in the past so we always have 2 points to glide between
+const TICK_MS = TICK_DT * 1000;
 const PITCH_LIMIT = 1.45; // can't look past straight up/down
 
 /** Turn an angle into the range -PI..PI. */
@@ -62,6 +63,10 @@ export class World {
   pitch = 0; // where I look (up/down)
   private seq = 0;
   private pending: { seq: number; ix: number; iy: number; yaw: number }[] = []; // inputs the server hasn't confirmed yet
+  private corrX = 0; // position fix still to apply (spread over a few frames so the camera never jumps)
+  private corrY = 0;
+  private corrZ = 0;
+  private clockOffset: number | null = null; // local time minus server time (for steady interpolation)
 
   constructor(
     public me: number,
@@ -101,17 +106,24 @@ export class World {
     this.buffers.delete(slot);
   }
 
-  /** Server update: [slot, x, y, z, ack, yaw, pitch,  slot, x, ...] */
+  /** Server update: [tick,  slot, x, y, z, ack, yaw, pitch,  slot, x, ...] */
   onSnapshot(a: number[]) {
     const now = performance.now();
-    for (let i = 0; i + 6 < a.length; i += 7) {
+    // Time each update by the SERVER's clock, not by when it arrived: packets often arrive
+    // in bursts on mobile data, and using arrival time would make other players stutter.
+    const serverMs = a[0] * TICK_MS;
+    const seen = now - serverMs;
+    this.clockOffset = this.clockOffset === null ? seen : Math.min(seen, this.clockOffset + 2); // follows the fastest arrivals
+    const t = serverMs + this.clockOffset;
+    for (let i = 1; i + 6 < a.length; i += 7) {
       const slot = a[i];
       if (slot === this.me) {
         this.reconcile(a[i + 1], a[i + 2], a[i + 3], a[i + 4]);
       } else {
         const buf = this.buffers.get(slot);
         if (!buf) continue;
-        buf.push({ t: now, x: a[i + 1], y: a[i + 2], z: a[i + 3], yaw: a[i + 5], pitch: a[i + 6] });
+        const last = buf[buf.length - 1];
+        buf.push({ t: Math.max(t, last ? last.t + 1 : t), x: a[i + 1], y: a[i + 2], z: a[i + 3], yaw: a[i + 5], pitch: a[i + 6] });
         if (buf.length > 12) buf.shift();
       }
     }
@@ -120,7 +132,8 @@ export class World {
   /**
    * Prediction fix-up. The server says "you are here after input #ack".
    * We replay the inputs it hasn't seen yet to guess where we SHOULD be now,
-   * then nudge our local position toward that (a big error just snaps).
+   * then glide toward that over the next few frames (tiny differences are ignored,
+   * a big error just snaps).
    */
   private reconcile(sx: number, sy: number, sz: number, ack: number) {
     this.pending = this.pending.filter((p) => p.seq > ack);
@@ -129,20 +142,32 @@ export class World {
     const dx = ex - this.lx;
     const dy = ey - this.ly;
     const dz = ez - this.lz;
-    if (Math.hypot(dx, dy, dz) > 1.2) {
+    const err = Math.hypot(dx, dy, dz);
+    if (err > 1.2) {
       this.lx = ex; // way off -> snap
       this.ly = ey;
       this.lz = ez;
+      this.corrX = this.corrY = this.corrZ = 0;
+    } else if (err > 0.04) {
+      this.corrX = dx; // a little off -> fix smoothly in moveMine()
+      this.corrY = dy;
+      this.corrZ = dz;
     } else {
-      this.lx += dx * 0.2; // slightly off -> glide back
-      this.ly += dy * 0.2;
-      this.lz += dz * 0.2;
+      this.corrX = this.corrY = this.corrZ = 0; // close enough: leave the camera alone
     }
   }
 
   /** Move my player right now (the same Rapier physics as the server). */
   moveMine(ix: number, iy: number, dtSeconds: number) {
     [this.lx, this.ly, this.lz] = this.mover.step(this.lx, this.ly, this.lz, ix, iy, this.yaw, dtSeconds);
+    // apply part of any pending correction each frame
+    const k = 1 - Math.exp(-dtSeconds * 8);
+    this.lx += this.corrX * k;
+    this.ly += this.corrY * k;
+    this.lz += this.corrZ * k;
+    this.corrX -= this.corrX * k;
+    this.corrY -= this.corrY * k;
+    this.corrZ -= this.corrZ * k;
   }
 
   /** Send my input + look direction to the server (called every 50 ms). */
@@ -195,6 +220,7 @@ export interface ViewData {
   onPrompt: (text: string | null) => void; // "E / ✋: open door" hint
   requestDoor: (id: string) => void; // ask the server to open/close a door
   onLocked: (message: string) => void;
+  onNotice?: (message: string) => void; // e.g. "switched to Low graphics"
 }
 
 export interface ViewStats {
@@ -217,8 +243,8 @@ export interface ViewHandle {
 
 const QUALITY: Record<Quality, { ratio: number; shadow: number; remoteLights: number }> = {
   low: { ratio: 1, shadow: 0, remoteLights: 0 },
-  medium: { ratio: 1.25, shadow: 512, remoteLights: 2 },
-  high: { ratio: 2, shadow: 1024, remoteLights: 4 },
+  medium: { ratio: 1, shadow: 512, remoteLights: 1 },
+  high: { ratio: 2, shadow: 1024, remoteLights: 3 },
 };
 
 export function createView(parent: HTMLElement, data: ViewData): ViewHandle {
@@ -237,7 +263,8 @@ export function createView(parent: HTMLElement, data: ViewData): ViewHandle {
   scene.fog = new THREE.FogExp2(0x050403, 0.055); // long corridors fade into darkness
   scene.add(new THREE.AmbientLight(0x2a2230, 0.09)); // just enough to make out shapes
 
-  const camera = new THREE.PerspectiveCamera(settings.fov, 1, 0.05, 70);
+  // near/far kept tight (fog hides everything past ~40 m anyway): sharper depth = no flickering surfaces on phones
+  const camera = new THREE.PerspectiveCamera(settings.fov, 1, 0.08, 45);
   camera.rotation.order = 'YXZ'; // yaw first, then pitch (normal FPS camera)
   scene.add(camera);
 
@@ -267,7 +294,7 @@ export function createView(parent: HTMLElement, data: ViewData): ViewHandle {
     flash.map = q.shadow > 0 ? cookie : null; // (three.js needs shadows on for a spotlight cookie)
     flash.shadow.mapSize.set(q.shadow || 512, q.shadow || 512);
     flash.shadow.bias = -0.0005;
-    flash.shadow.normalBias = 0.02;
+    flash.shadow.normalBias = q.shadow <= 512 ? 0.045 : 0.03; // stops speckled "shadow acne" on walls
     flash.shadow.camera.near = 0.15;
     flash.shadow.camera.far = FLASH_RANGE;
     flash.shadow.map?.dispose();
@@ -420,7 +447,7 @@ export function createView(parent: HTMLElement, data: ViewData): ViewHandle {
   function frame(nowMs: number) {
     raf = requestAnimationFrame(frame);
     if (!mansion || !post) return;
-    const dtMs = Math.min(nowMs - last, 100);
+    const dtMs = Math.min(nowMs - last, 250); // (a big clamp: slow phones must still walk at full speed)
     last = nowMs;
     const dt = Math.max(0, dtMs) / 1000;
     renderer.info.reset();
@@ -551,22 +578,40 @@ export function createView(parent: HTMLElement, data: ViewData): ViewHandle {
 
     post.render(dt);
 
-    // ---- 9. keep it smooth: lower the resolution a bit if the phone struggles ----
+    // ---- 9. keep it smooth ----
+    // Every 2 s: if the phone struggles, lower the resolution a step. Raise it again only after
+    // a long smooth stretch (changing it often causes hitches). If even the lowest resolution
+    // is too slow, drop the quality preset once (unless you picked it yourself in settings).
     perfTimer += dtMs;
     perfFrames++;
     if (perfTimer > 2000) {
       fps = (perfFrames * 1000) / perfTimer;
-      if (fps < 40 && dynScale > 0.6) {
-        dynScale -= 0.1;
-        resize();
-      } else if (fps > 57 && dynScale < 1) {
-        dynScale = Math.min(1, dynScale + 0.05);
-        resize();
-      }
       perfTimer = 0;
       perfFrames = 0;
+      if (fps < 40) {
+        smoothWindows = 0;
+        if (dynScale > 0.65) {
+          dynScale = Math.round((dynScale - 0.1) * 100) / 100;
+          resize();
+        } else if (++slowWindows >= 2 && !settings.qualityChosen && settings.quality !== 'low') {
+          const lower = settings.quality === 'high' ? 'medium' : 'low';
+          slowWindows = 0;
+          dynScale = 1;
+          settings.update({ quality: lower });
+          data.onNotice?.(`Switched to ${lower === 'low' ? 'Low' : 'Medium'} graphics for smoother play (change it in ⚙️).`);
+        }
+      } else {
+        slowWindows = 0;
+        if (fps > 55 && dynScale < 1 && ++smoothWindows >= 5) {
+          smoothWindows = 0;
+          dynScale = Math.min(1, Math.round((dynScale + 0.1) * 100) / 100);
+          resize();
+        }
+      }
     }
   }
+  let slowWindows = 0;
+  let smoothWindows = 0;
 
   /** 1 = steady. Near a ghost the light stutters and sometimes nearly dies. */
   function flicker(ghostDist: number, t: number): number {

@@ -69,7 +69,7 @@ export const MATERIALS: Record<string, MatDef> = {
  * reaches it (computed once while loading, see mansion.ts). This shader patch
  * adds that light, so only the flashlights cost real lighting each frame.
  */
-function addBakedLight(m: THREE.MeshStandardMaterial) {
+function addBakedLight(m: THREE.MeshStandardMaterial | THREE.MeshLambertMaterial) {
   m.onBeforeCompile = (sh) => {
     sh.vertexShader = 'attribute vec3 baked;\nvarying vec3 vBaked;\n' + sh.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\n\tvBaked = baked;');
     sh.fragmentShader = 'varying vec3 vBaked;\n' + sh.fragmentShader.replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n\ttotalEmissiveRadiance += vBaked * diffuseColor.rgb;');
@@ -108,12 +108,10 @@ export async function buildMaterials(assets: Assets, quality: Quality, progress:
   });
 
   for (const { key, def, files, uploaded, weight } of plans) {
-    const m = new THREE.MeshStandardMaterial({
-      color: def.color ?? '#ffffff',
-      roughness: def.roughness ?? 1,
-      metalness: def.metalness ?? 0,
-      vertexColors: true,
-    });
+    // Low quality uses the cheaper "Lambert" lighting (no shiny highlights) - much faster on budget phones
+    const m = lo
+      ? new THREE.MeshLambertMaterial({ color: def.color ?? '#ffffff', vertexColors: true })
+      : new THREE.MeshStandardMaterial({ color: def.color ?? '#ffffff', roughness: def.roughness ?? 1, metalness: def.metalness ?? 0, vertexColors: true });
     if (def.emissive) {
       m.emissive.set(def.emissive);
       m.emissiveIntensity = def.emissiveIntensity ?? 1;
@@ -135,8 +133,10 @@ export async function buildMaterials(assets: Assets, quality: Quality, progress:
     if (maps) {
       m.map = maps.color;
       m.normalMap = maps.normal;
-      m.roughnessMap = maps.roughness;
-      m.roughness = maps.roughness ? 1 : 0.8;
+      if (m instanceof THREE.MeshStandardMaterial) {
+        m.roughnessMap = maps.roughness;
+        m.roughness = maps.roughness ? 1 : 0.8;
+      }
       if (def.normalScale) m.normalScale.setScalar(def.normalScale);
       const rep = def.tile ? 1 / def.tile : 1;
       for (const t of [maps.color, maps.normal, maps.roughness]) {
