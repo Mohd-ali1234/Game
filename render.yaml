@@ -1,0 +1,15 @@
+# Render "Blueprint": tells Render how to deploy this repo automatically.
+# In Render: New + -> Blueprint -> pick this repo -> Apply.
+services:
+  - type: web
+    name: dark-hunt
+    runtime: node
+    region: singapore        # closest free region to India = lower lag
+    plan: free               # free tier (sleeps after ~15 min without visitors)
+    # --include=dev makes sure TypeScript/Vite/Phaser are installed for the build step.
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
