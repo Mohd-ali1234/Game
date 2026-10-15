@@ -5,10 +5,10 @@
 // =====================================================================
 import './style.css';
 import { io } from 'socket.io-client';
-import { MAX_PLAYERS } from '../../shared/game';
+import { MAX_PLAYERS, Mover } from '../../shared/game';
 import { AVATARS, avatarCanvas } from './avatars';
-import { createGame, GameHandle, PlayerInfo, World } from './game';
-import { DebugPanel, isTouchDevice, Joystick, toast } from './ui';
+import { createView, PlayerInfo, ViewHandle, World } from './game';
+import { DebugPanel, isTouchDevice, Joystick, LookPad, Settings, toast } from './ui';
 import { Voice } from './voice';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -37,9 +37,13 @@ voice.log = (m) => debug.log(m);
 voice.attach(socket);
 const joystick = new Joystick($('joyArea'));
 joystick.show(false);
+const lookPad = new LookPad($('joyArea'));
+lookPad.show(false);
+const settings = new Settings();
+let mover: Mover | null = null; // Rapier physics (WebAssembly), loaded once when you first enter a room
 
 let world: World | null = null;
-let gameHandle: GameHandle | null = null;
+let gameHandle: ViewHandle | null = null;
 let session: { code: string; token: string; slot: number } | null = null;
 let everConnected = false;
 let ping = 0;
@@ -158,16 +162,29 @@ function askForMic(): Promise<void> {
 }
 
 // ---------- 3. inside the room ----------
-function enterRoom(res: JoinReply) {
+async function enterRoom(res: JoinReply) {
   session = { code: res.code, token: res.token, slot: res.slot };
   history.replaceState(null, '', `?room=${res.code}`);
   $('roomCode').textContent = res.code;
 
-  world = new World(res.slot, res.players, (seq, ix, iy) => socket.emit('in', [seq, ix, iy]));
+  mover ??= await Mover.create(); // same physics as the server, so movement prediction matches
+  if (!session) return; // we left while the physics were loading
+  world = new World(res.slot, res.players, mover, (seq, ix, iy, yaw, pitch) =>
+    socket.emit('in', [seq, ix, iy, Math.round(yaw * 1000), Math.round(pitch * 1000)]),
+  );
   show($('lobby'), false);
   show($('hud'), true);
-  joystick.show(isTouchDevice());
-  gameHandle = createGame($('game'), { world, voice, getStick: () => joystick });
+  const touch = isTouchDevice();
+  joystick.show(touch);
+  lookPad.show(touch);
+  gameHandle = createView($('game'), {
+    world,
+    voice,
+    settings,
+    getStick: () => joystick,
+    consumeLook: () => lookPad.consume(),
+    onLockChange: (locked) => show($('lockHint'), !locked && !touch),
+  });
   connectVoiceToEveryone(res.players);
   refreshMuteButton();
   toast(voice.micState === 'on' ? 'Voice chat on - use headphones 🎧' : 'Playing without a microphone');
@@ -199,7 +216,10 @@ function leaveRoom(message = '') {
   gameHandle = null;
   voice.closeAll();
   joystick.show(false);
+  lookPad.show(false);
   show($('hud'), false);
+  show($('lockHint'), false);
+  show($('settings'), false);
   show($('banner'), false);
   show($('lobby'), true);
   history.replaceState(null, '', location.pathname);
@@ -242,6 +262,34 @@ $('muteBtn').addEventListener('click', () => {
   refreshMuteButton();
 });
 $('debugBtn').addEventListener('click', () => debug.toggle());
+
+// ---------- settings panel: look sensitivity, field of view, low graphics ----------
+const sensInput = $<HTMLInputElement>('sensInput');
+const fovInput = $<HTMLInputElement>('fovInput');
+const lowInput = $<HTMLInputElement>('lowInput');
+function showSettingsValues() {
+  sensInput.value = String(settings.sens);
+  fovInput.value = String(settings.fov);
+  lowInput.checked = settings.lowGfx;
+  $('sensVal').textContent = settings.sens.toFixed(1) + 'x';
+  $('fovVal').textContent = settings.fov + '°';
+}
+showSettingsValues();
+sensInput.addEventListener('input', () => {
+  settings.update({ sens: Number(sensInput.value) });
+  showSettingsValues();
+});
+fovInput.addEventListener('input', () => {
+  settings.update({ fov: Number(fovInput.value) });
+  showSettingsValues();
+});
+lowInput.addEventListener('change', () => settings.update({ lowGfx: lowInput.checked }));
+$('settingsBtn').addEventListener('click', () => {
+  const panel = $('settings');
+  show(panel, panel.classList.contains('hidden'));
+  if (document.pointerLockElement) document.exitPointerLock(); // free the mouse so sliders can be used
+});
+$('settingsClose').addEventListener('click', () => show($('settings'), false));
 $('leaveBtn').addEventListener('click', () => leaveRoom());
 $('shareBtn').addEventListener('click', async () => {
   if (!session) return;
@@ -275,3 +323,5 @@ setInterval(() => {
   if (world) $('playerCount').textContent = String(world.infos.size);
   debug.render();
 }, 500);
+// green ring on the mic button while you are talking
+setInterval(() => $('muteBtn').classList.toggle('talking', !!session && voice.localSpeaking()), 150);

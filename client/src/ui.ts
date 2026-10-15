@@ -1,7 +1,9 @@
 // =====================================================================
 // client/src/ui.ts
 // Small on-screen helpers made of plain HTML:
-//   - Joystick   : touch stick for phones
+//   - Joystick   : left-thumb touch stick for phones (move)
+//   - LookPad    : drag on the right half of the screen to look around (phones)
+//   - Settings   : look sensitivity, field of view, low-graphics (saved on the device)
 //   - DebugPanel : errors, connection status, ping, FPS, player count
 //   - toast()    : short pop-up messages ("Sam joined")
 // =====================================================================
@@ -76,6 +78,89 @@ export class Joystick {
 }
 
 // ---------------------------------------------------------------------
+/** Drag anywhere on the right half of the screen to look around (phones). */
+export class LookPad {
+  private dx = 0;
+  private dy = 0;
+  private pointerId: number | null = null;
+  private lastX = 0;
+  private lastY = 0;
+  private el: HTMLDivElement;
+
+  constructor(parent: HTMLElement) {
+    this.el = document.createElement('div');
+    this.el.className = 'look-pad'; // covers the right half of the screen
+    parent.appendChild(this.el);
+    this.el.addEventListener('pointerdown', (e) => {
+      if (this.pointerId !== null) return;
+      this.pointerId = e.pointerId;
+      this.el.setPointerCapture(e.pointerId);
+      this.lastX = e.clientX;
+      this.lastY = e.clientY;
+    });
+    this.el.addEventListener('pointermove', (e) => {
+      if (e.pointerId !== this.pointerId) return;
+      this.dx += e.clientX - this.lastX;
+      this.dy += e.clientY - this.lastY;
+      this.lastX = e.clientX;
+      this.lastY = e.clientY;
+    });
+    const release = (e: PointerEvent) => {
+      if (e.pointerId === this.pointerId) this.pointerId = null;
+    };
+    this.el.addEventListener('pointerup', release);
+    this.el.addEventListener('pointercancel', release);
+  }
+
+  /** How many pixels the finger moved since the last call. */
+  consume(): { dx: number; dy: number } {
+    const r = { dx: this.dx, dy: this.dy };
+    this.dx = this.dy = 0;
+    return r;
+  }
+
+  show(visible: boolean) {
+    this.el.style.display = visible ? 'block' : 'none';
+    if (!visible) this.pointerId = null;
+  }
+}
+
+// ---------------------------------------------------------------------
+/** Player settings, remembered on this device. */
+export class Settings {
+  sens = 1; // look sensitivity multiplier (0.2 - 3)
+  fov = 75; // field of view in degrees (50 - 110)
+  lowGfx = false; // low graphics = shadows off (for budget phones)
+  private listeners: (() => void)[] = [];
+
+  constructor() {
+    try {
+      const raw = localStorage.getItem('dh_settings');
+      if (raw) Object.assign(this, JSON.parse(raw));
+      else this.lowGfx = isTouchDevice(); // phones start in low-graphics mode; turn it off in ⚙️ if yours is fast
+    } catch {
+      /* storage blocked: use defaults */
+    }
+  }
+
+  /** Call `fn` whenever a setting changes. Returns a function that stops listening. */
+  onChange(fn: () => void): () => void {
+    this.listeners.push(fn);
+    return () => (this.listeners = this.listeners.filter((f) => f !== fn));
+  }
+
+  update(patch: Partial<Pick<Settings, 'sens' | 'fov' | 'lowGfx'>>) {
+    Object.assign(this, patch);
+    try {
+      localStorage.setItem('dh_settings', JSON.stringify({ sens: this.sens, fov: this.fov, lowGfx: this.lowGfx }));
+    } catch {
+      /* ignore */
+    }
+    this.listeners.forEach((f) => f());
+  }
+}
+
+// ---------------------------------------------------------------------
 export class DebugPanel {
   private box: HTMLDivElement;
   private statsEl: HTMLDivElement;
@@ -100,6 +185,11 @@ export class DebugPanel {
     console.error = (...args: unknown[]) => {
       this.log('console.error: ' + args.map(String).join(' '));
       origError(...args);
+    };
+    const origWarn = console.warn.bind(console);
+    console.warn = (...args: unknown[]) => {
+      this.log('warning: ' + args.map(String).join(' '));
+      origWarn(...args);
     };
   }
 

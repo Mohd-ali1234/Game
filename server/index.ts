@@ -3,20 +3,21 @@
 // The ONE Node.js app that does everything:
 //   1. serves the built game files (dist/client)
 //   2. runs the multiplayer server (Socket.IO) - the server "owns" positions
+//      and uses Rapier physics for wall/floor collisions
 //   3. relays voice-chat signaling messages between players (WebRTC setup)
 //
 // Network messages are tiny arrays to save mobile data:
-//   client -> server  'in'  [seq, ix, iy]       my input (-100..100 each)
-//   server -> clients 'st'  [slot,x,y,ack, ...] positions of everyone (20x/sec)
-//   server -> clients 'pj'  {s,n,a,x,y}         a player joined
-//   server -> clients 'pl'  slot                a player left
-//   both ways         'sig' {to|from, d}        voice-chat (WebRTC) setup messages
+//   client -> server  'in'  [seq, ix, iy, yaw*1000, pitch*1000]   my input
+//   server -> clients 'st'  [slot,x,z,ack,yaw,pitch, ...]         everyone (20x/sec)
+//   server -> clients 'pj'  {s,n,a,x,z,w}   a player joined (w = yaw)
+//   server -> clients 'pl'  slot            a player left
+//   both ways         'sig' {to|from, d}    voice-chat (WebRTC) setup messages
 // =====================================================================
 import express from 'express';
 import http from 'http';
 import path from 'path';
 import { Server, Socket } from 'socket.io';
-import { MAX_PLAYERS, NUM_AVATARS, SPAWNS, TICK_DT, TICK_RATE, moveStep } from '../shared/game';
+import { MAX_PLAYERS, Mover, NUM_AVATARS, SPAWNS, SPAWN_YAW, TICK_DT, TICK_RATE } from '../shared/game';
 
 const PORT = Number(process.env.PORT) || 3000;
 const GRACE_MS = 20000; // how long a dropped player's spot is kept so they can reconnect
@@ -26,8 +27,10 @@ interface Player {
   name: string;
   av: number; // avatar number
   x: number;
-  y: number;
-  ix: number; // latest input
+  z: number;
+  yaw: number; // where they look (left/right), radians
+  pitch: number; // where they look (up/down), radians
+  ix: number; // latest movement input
   iy: number;
   seq: number; // sequence number of the latest input we applied
   lastIn: number; // when the latest input arrived (ms)
@@ -43,6 +46,7 @@ interface Room {
 }
 
 const rooms = new Map<string, Room>();
+let mover: Mover; // Rapier collision engine (created before the server starts listening)
 
 // ---------- web server ----------
 const app = express();
@@ -84,9 +88,11 @@ function clampInput(raw: unknown): number {
   return Number.isFinite(n) ? Math.max(-100, Math.min(100, n)) : 0;
 }
 
+const r2 = (n: number) => Math.round(n * 100) / 100;
+
 /** What we tell clients about a player (short keys = fewer bytes). */
 function publicInfo(p: Player) {
-  return { s: p.slot, n: p.name, a: p.av, x: Math.round(p.x), y: Math.round(p.y) };
+  return { s: p.slot, n: p.name, a: p.av, x: r2(p.x), z: r2(p.z), w: r2(p.yaw) };
 }
 
 function roomInfo(room: Room) {
@@ -96,9 +102,9 @@ function roomInfo(room: Room) {
 function addPlayer(room: Room, sock: Socket, name: string, av: number): Player | null {
   for (let slot = 0; slot < MAX_PLAYERS; slot++) {
     if (room.players.has(slot)) continue;
-    const [x, y] = SPAWNS[slot];
+    const [x, z] = SPAWNS[slot];
     const p: Player = {
-      slot, name, av, x, y, ix: 0, iy: 0, seq: 0,
+      slot, name, av, x, z, yaw: SPAWN_YAW, pitch: 0, ix: 0, iy: 0, seq: 0,
       lastIn: Date.now(), token: makeToken(), sock, dropAt: 0,
     };
     room.players.set(slot, p);
@@ -173,7 +179,7 @@ io.on('connection', (sock) => {
     room.dirty = true;
   });
 
-  // My movement input
+  // My input: [seq, ix, iy, yaw*1000, pitch*1000]
   sock.on('in', (msg: unknown) => {
     const room = rooms.get(sock.data.code);
     const p = room?.players.get(sock.data.slot);
@@ -183,6 +189,10 @@ io.on('connection', (sock) => {
     p.seq = seq;
     p.ix = clampInput(msg[1]);
     p.iy = clampInput(msg[2]);
+    const yaw = Number(msg[3]) / 1000;
+    const pitch = Number(msg[4]) / 1000;
+    if (Number.isFinite(yaw)) p.yaw = yaw;
+    if (Number.isFinite(pitch)) p.pitch = Math.max(-1.6, Math.min(1.6, pitch));
     p.lastIn = Date.now();
     room.dirty = true; // so the client gets its new "ack" number back
   });
@@ -219,7 +229,7 @@ io.on('connection', (sock) => {
 });
 
 // ---------- the game loop: runs 20 times per second ----------
-setInterval(() => {
+function tick() {
   const now = Date.now();
   for (const room of rooms.values()) {
     let changed = room.dirty;
@@ -234,10 +244,10 @@ setInterval(() => {
       // No input for half a second? Stop moving (safety if messages get lost).
       if (now - p.lastIn > 500) p.ix = p.iy = 0;
       if (p.ix !== 0 || p.iy !== 0) {
-        const [nx, ny] = moveStep(p.x, p.y, p.ix, p.iy, TICK_DT);
-        if (nx !== p.x || ny !== p.y) {
+        const [nx, nz] = mover.step(p.x, p.z, p.ix, p.iy, p.yaw, TICK_DT);
+        if (nx !== p.x || nz !== p.z) {
           p.x = nx;
-          p.y = ny;
+          p.z = nz;
           changed = true;
         }
       }
@@ -248,12 +258,17 @@ setInterval(() => {
       continue;
     }
     if (changed) {
-      // Flat compact array: [slot, x, y, ack, slot, x, y, ack, ...]
+      // Flat compact array: [slot, x, z, ack, yaw, pitch,  slot, x, z, ...]
       const snap: number[] = [];
-      for (const p of room.players.values()) snap.push(p.slot, Math.round(p.x * 10) / 10, Math.round(p.y * 10) / 10, p.seq);
+      for (const p of room.players.values()) snap.push(p.slot, r2(p.x), r2(p.z), p.seq, r2(p.yaw), r2(p.pitch));
       io.to(room.code).volatile.emit('st', snap); // volatile = ok to drop if the network is busy
     }
   }
-}, 1000 / TICK_RATE);
+}
 
-server.listen(PORT, () => console.log(`Game server running on port ${PORT}`));
+// Start: load the physics engine first, then open the doors
+Mover.create().then((m) => {
+  mover = m;
+  setInterval(tick, 1000 / TICK_RATE);
+  server.listen(PORT, () => console.log(`Game server running on port ${PORT}`));
+});

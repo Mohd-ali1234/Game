@@ -29,8 +29,8 @@ export const ICE_SERVERS: RTCIceServer[] = [
   // },
 ];
 
-export const HEAR_FULL = 150; // closer than this (pixels): full volume
-export const HEAR_MAX = 520; // farther than this: silence
+export const HEAR_FULL = 3; // closer than this (meters): full volume
+export const HEAR_MAX = 10.5; // farther than this: silence
 
 interface Peer {
   pc: RTCPeerConnection;

@@ -8,7 +8,7 @@ html, body {
   font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   touch-action: none; overscroll-behavior: none; user-select: none; -webkit-user-select: none;
 }
-#game { position: fixed; inset: 0; }
+#game { position: fixed; inset: 0; background: #000; }
 #game canvas { display: block; }
 .hidden { display: none !important; }
 
@@ -114,3 +114,25 @@ button.primary { background: #8c2f39; border-color: #b8434f; font-weight: bold; 
 }
 .debug-stats { color: #7dff9a; margin-bottom: 6px; word-spacing: 2px; }
 .debug-log { white-space: pre-wrap; color: #ffd27d; }
+
+/* ---------- first-person 3D additions ---------- */
+.game-canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+.look-pad { position: fixed; z-index: 9; display: none; top: 0; bottom: 0; left: 50%; right: 0; touch-action: none; } /* right half = look */
+#lockHint {
+  position: fixed; z-index: 12; left: 50%; top: 50%; transform: translate(-50%, -50%); text-align: center;
+  background: #000b; padding: 14px 20px; border-radius: 12px; pointer-events: none; font-size: 18px;
+}
+#lockHint small { color: #aaa; font-size: 13px; }
+/* the crosshair dot in the middle of the screen */
+#hud::after { content: ''; position: absolute; left: 50%; top: 50%; width: 4px; height: 4px; margin: -2px 0 0 -2px; border-radius: 50%; background: rgba(255,255,255,0.55); }
+.round.talking { box-shadow: 0 0 0 3px #3cff7a; }
+
+#settings {
+  position: fixed; z-index: 45; top: 60px; left: 50%; transform: translateX(-50%); width: min(92vw, 360px);
+  max-height: calc(100% - 80px); overflow-y: auto; padding: 16px; border-radius: 14px;
+  background: #15151dee; border: 1px solid #3a3a50; box-shadow: 0 8px 40px #000a; touch-action: pan-y;
+}
+#settings h3 { margin: 0 0 4px; }
+#settings input[type='range'] { width: 100%; padding: 0; height: 28px; }
+#settings label.check { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; color: #ddd; margin-top: 14px; }
+#settings label.check input { width: 22px; height: 22px; flex: none; padding: 0; }
